@@ -18,9 +18,9 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (v1.4.0 Fingerprint) 已加载")
+print("DEBUG: MemeMaster Pro (v1.4.1 Context-Aware) 已加载")
 
-@register("vv_meme_master", "MemeMaster", "防抖+表情包+去重指纹", "1.4.0")
+@register("vv_meme_master", "MemeMaster", "防抖+表情包+去重+上下文", "1.4.1")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -36,16 +36,14 @@ class MemeMaster(Star):
         self.local_config = self.load_config()
         self.data = self.load_data()
         
-        # 指纹缓存库 {filename: dhash_string}
+        # 指纹缓存库
         self.img_hashes = {} 
-        
         self.sessions = {}
         self.pair_map = {'“': '”', '《': '》', '（': '）', '(': ')', '[': ']', '{': '}'}
 
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self.start_web_server())
-            # 启动时后台建立指纹库
             loop.create_task(self._init_image_hashes())
         except Exception as e:
             print(f"ERROR: 启动任务失败: {e}")
@@ -54,69 +52,44 @@ class MemeMaster(Star):
     # 核心功能：视觉指纹 (dHash)
     # ==========================
     async def _init_image_hashes(self):
-        """后台任务：计算现有图片的指纹"""
-        print("[Meme] 正在建立图片指纹库 (去重用)...")
+        print("[Meme] 正在建立图片指纹库...")
         count = 0
         loop = asyncio.get_running_loop()
         files = os.listdir(self.img_dir)
-        
         for f in files:
-            # 简单过滤非图片
             if not f.lower().endswith(('.jpg', '.png', '.jpeg', '.gif', '.webp')): continue
-            
             path = os.path.join(self.img_dir, f)
             try:
-                with open(path, "rb") as file:
-                    data = file.read()
-                # 扔到线程池计算，防止卡顿
+                with open(path, "rb") as file: data = file.read()
                 h = await loop.run_in_executor(self.executor, self.calc_dhash, data)
                 if h: self.img_hashes[f] = h
                 count += 1
             except: pass
-            
         print(f"[Meme] 指纹库建立完成，共索引 {count} 张图片")
 
     def calc_dhash(self, image_data: bytes) -> str:
-        """计算图片的差异哈希 (dHash)"""
         try:
-            # 1. 打开图片
-            if isinstance(image_data, bytes):
-                img = PILImage.open(io.BytesIO(image_data))
-            else:
-                return None
-                
-            # 2. 缩放到 9x8 并转灰度
+            if isinstance(image_data, bytes): img = PILImage.open(io.BytesIO(image_data))
+            else: return None
             img = img.resize((9, 8), PILImage.Resampling.LANCZOS).convert('L')
-            
-            # 3. 计算差异
             pixels = list(img.getdata())
             diff = []
             for row in range(8):
                 for col in range(8):
                     idx = row * 9 + col
-                    # 如果左边像素比右边亮，记为1，否则0
                     diff.append(pixels[idx] > pixels[idx + 1])
-            
-            # 4. 转十六进制字符串
             decimal_value = 0
             for index, value in enumerate(diff):
                 if value: decimal_value += 2**index
             return hex(decimal_value)[2:]
-            
-        except Exception:
-            return None
+        except Exception: return None
 
     def is_duplicate(self, new_hash: str, threshold=5) -> bool:
-        """检查是否存在相似图片 (汉明距离 < 阈值)"""
         if not new_hash: return False
-        
         for filename, existing_hash in self.img_hashes.items():
-            # 计算汉明距离
             try:
                 dist = bin(int(new_hash, 16) ^ int(existing_hash, 16)).count('1')
-                if dist <= threshold:
-                    # print(f"[Meme] 发现重复: 与 {filename} 相似度高 (dist={dist})")
-                    return True
+                if dist <= threshold: return True
             except: continue
         return False
 
@@ -129,10 +102,8 @@ class MemeMaster(Star):
             max_size = 350 
             w, h = img.size
             if w > max_size or h > max_size:
-                if w > h:
-                    new_w = max_size; new_h = int(h * (max_size / w))
-                else:
-                    new_h = max_size; new_w = int(w * (max_size / h))
+                if w > h: new_w = max_size; new_h = int(h * (max_size / w))
+                else: new_h = max_size; new_w = int(w * (max_size / h))
                 img = img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
             
             buffer = io.BytesIO()
@@ -144,8 +115,7 @@ class MemeMaster(Star):
                 if img.mode != "RGB": img = img.convert("RGB")
                 img.save(buffer, format="JPEG", quality=70, optimize=True)
                 return buffer.getvalue(), ".jpg"
-        except Exception as e:
-            return image_data, ".jpg"
+        except Exception: return image_data, ".jpg"
 
     async def download_image(self, url):
         try:
@@ -180,15 +150,15 @@ class MemeMaster(Star):
 
             if not msg_str and not img_url: return
 
-            # 暗线：自动进货 (逻辑优化：先判断指纹，再问AI)
-            if img_url and not msg_str and not msg_str.startswith("/"):
+            # 【优化】暗线：自动进货 (传入 msg_str 作为上下文)
+            if img_url and not msg_str.startswith("/"):
                 cooldown = self.local_config.get("auto_save_cooldown", 60)
                 last_save = getattr(self, "last_auto_save_time", 0)
                 if time.time() - last_save > cooldown:
                     print(f"[Meme] 收到图片，准备后台鉴定...")
-                    asyncio.create_task(self.ai_evaluate_image(img_url))
+                    # 这里的 msg_str 就是你发图时说的话，传给 AI
+                    asyncio.create_task(self.ai_evaluate_image(img_url, msg_str))
 
-            # 指令穿透
             if msg_str.startswith("/") or msg_str.startswith("！") or msg_str.startswith("!"):
                 if uid in self.sessions:
                     if self.sessions[uid].get('timer_task'): self.sessions[uid]['timer_task'].cancel()
@@ -198,7 +168,6 @@ class MemeMaster(Star):
             debounce_time = self.local_config.get("debounce_time", 2.0)
             if debounce_time <= 0: return
 
-            # A. 续杯
             if uid in self.sessions:
                 s = self.sessions[uid]
                 if msg_str: s['queue'].append({'type':'text', 'content':msg_str})
@@ -208,7 +177,6 @@ class MemeMaster(Star):
                 event.stop_event()
                 return
 
-            # B. 新杯
             flush_event = asyncio.Event()
             timer_task = asyncio.create_task(self._timer_coroutine(uid, debounce_time))
             initial_queue = []
@@ -222,7 +190,6 @@ class MemeMaster(Star):
             print(f"[Meme] 开始防抖 ({debounce_time}s)...")
             await flush_event.wait() 
 
-            # C. 结算
             if uid not in self.sessions: return
             s = self.sessions.pop(uid)
             queue = s['queue']
@@ -299,63 +266,55 @@ class MemeMaster(Star):
                     mixed_chain.append(Plain(part))
             
             segments = self.smart_split(mixed_chain)
-            
             delay_base = self.local_config.get("delay_base", 0.5)
             delay_factor = self.local_config.get("delay_factor", 0.1)
             
             for i, seg in enumerate(segments):
                 txt_content = "".join([c.text for c in seg if isinstance(c, Plain)])
                 wait = delay_base + (len(txt_content) * delay_factor)
-                
                 mc = MessageChain()
                 mc.chain = seg
                 await self.context.send_message(event.unified_msg_origin, mc)
-                
                 if i < len(segments) - 1: await asyncio.sleep(wait)
             
             event.set_result(None)
-
         except Exception as e:
             print(f"分段发送出错: {e}")
 
     # ==========================
-    # 核心 3: 自动进货 (加入去重)
+    # 核心 3: 自动进货 (加入上下文 + 修正提示词)
     # ==========================
-    async def ai_evaluate_image(self, img_url):
+    async def ai_evaluate_image(self, img_url, context_text=""):
         try:
             self.last_auto_save_time = time.time()
             
-            # 1. 先下载原图
             img_data = await self.download_image(img_url)
             if not img_data: return
 
-            # 2. 计算指纹并去重
             loop = asyncio.get_running_loop()
             current_hash = await loop.run_in_executor(self.executor, self.calc_dhash, img_data)
-            
             if current_hash and self.is_duplicate(current_hash):
                 print(f"💛 [自动进货] 图片已存在 (指纹匹配)，跳过")
-                return # 直接结束，不问AI
+                return 
 
-            # 3. 询问 AI
             provider = self.context.get_using_provider()
             if not provider: return
             
-            prompt = """你正在帮我整理一个 QQ 表情包素材库。
-请判断这张图片是否“值得被保存”，
-作为未来聊天中可能会使用的表情包素材。
-判断时请注意：
-- 这是一个偏二次元 / meme 使用环境
-- 常见来源包括：chiikawa、这狗、线条小狗、多栋、猫meme 等
-- 不要过度严肃，也不要把普通照片当成表情包
-如果这张图不适合做表情包，请只回复：NO
-如果适合，请严格按下面格式回复：
+            # 【优化】更严谨的 Prompt
+            prompt = f"""你正在帮我整理一个表情包素材库。
+请判断这张图片是否“值得被保存”为表情包。
+用户发送图片时附带的文字是：“{context_text}”。(请参考此上下文来判断图片的真实含义)
+
+判断规则：
+1. 这是一个偏二次元/Meme环境，但**严禁产生幻觉**。
+2. 如果图片是**企业Logo**（如Google、Gemini）、**真实照片**、**系统截图**，请如实判断，**不要**强行关联到游戏或动漫道具（严禁把星星形状误判为原石）。
+3. 如果这确实是一个表情包/梗图，请保存。
+4. 如果这只是普通图片，回复 NO。
+
+如果适合保存，请回复：
 YES
 <名称>:<一句自然语言解释这个表情包在什么语境下使用>"""
 
-            # 既然已经下载了，其实可以直接传 URL 比较快（节省上传带宽）
-            # 或者如果 Provider 支持 base64 也可以传 img_data
-            # 为了兼容性，我们还是传 URL 给 AI
             resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
             content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
             
@@ -366,21 +325,20 @@ YES
                     tag = tag_line.split(":")[0].replace("<", "").replace(">", "").strip()
                     desc = tag_line.split(":")[-1].strip()
                     full_tag = f"{tag}: {desc}"
-                    print(f"🖤 [自动进货] {full_tag}")
+                    print(f"🖤 [捡垃圾中] {full_tag}")
                     
-                    # 4. 保存
                     comp_data, ext = await loop.run_in_executor(self.executor, self.compress_image_sync, img_data)
                     fn = f"{int(time.time())}{ext}"
                     with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(comp_data)
                     
                     self.data[fn] = {"tags": full_tag, "source": "auto"}
-                    if current_hash: self.img_hashes[fn] = current_hash # 更新内存指纹库
+                    if current_hash: self.img_hashes[fn] = current_hash 
                     self.save_data()
         except Exception as e:
             print(f"鉴图出错: {e}")
 
     # ==========================
-    # Web Server & Helpers
+    # Web Server
     # ==========================
     async def start_web_server(self):
         app = web.Application()
@@ -410,10 +368,7 @@ YES
             if p.name == "file":
                 raw_data = await p.read()
                 loop = asyncio.get_running_loop()
-                # 上传时也计算 hash
                 current_hash = await loop.run_in_executor(self.executor, self.calc_dhash, raw_data)
-                
-                # 可选：上传时也去重？目前先不限制手动上传
                 compressed_data, ext = await loop.run_in_executor(self.executor, self.compress_image_sync, raw_data)
                 fn = f"{int(time.time()*1000)}_{random.randint(100,999)}{ext}"
                 with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(compressed_data)
@@ -426,18 +381,14 @@ YES
         count = 0; total_saved = 0
         loop = asyncio.get_running_loop()
         print("[Meme] 开始批量瘦身 & 重建指纹...")
-        self.img_hashes = {} # 清空重算
+        self.img_hashes = {}
         for f in os.listdir(self.img_dir):
             path = os.path.join(self.img_dir, f)
             try:
                 with open(path, 'rb') as file: raw = file.read()
                 old_size = len(raw)
-                
-                # 重建指纹
                 h = await loop.run_in_executor(self.executor, self.calc_dhash, raw)
                 if h: self.img_hashes[f] = h
-
-                # 压缩
                 new_data, ext = await loop.run_in_executor(self.executor, self.compress_image_sync, raw)
                 if len(new_data) < old_size:
                     with open(path, 'wb') as file: file.write(new_data)
@@ -479,7 +430,6 @@ YES
         try:
             with zipfile.ZipFile(buffer, 'r') as z: z.extractall(self.base_dir)
             self.data = self.load_data(); self.local_config = self.load_config()
-            # 恢复后必须重建指纹
             asyncio.create_task(self._init_image_hashes())
             return web.Response(text="ok")
         except Exception as e: return web.Response(status=500, text=str(e))
