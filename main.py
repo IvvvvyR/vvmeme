@@ -8,18 +8,19 @@ import aiohttp
 import difflib
 import zipfile
 import io
-import shutil
 from aiohttp import web
-from PIL import Image as PILImage  # 引入图片处理库
+
+# 引入图片处理库
+from PIL import Image as PILImage
 
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (Lioren Fixed) 已加载")
+print("DEBUG: MemeMaster Pro (Sticker Optimized) 已加载")
 
-@register("vv_meme_master", "MemeMaster", "防抖+表情包+拟人分段+图片压缩", "1.0.2")
+@register("vv_meme_master", "MemeMaster", "防抖+表情包+拟人分段", "1.0.5")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -34,8 +35,7 @@ class MemeMaster(Star):
         self.data = self.load_data()
         
         self.sessions = {}
-        # 补充更多成对符号，防止切割错误
-        self.pair_map = {'“': '”', '《': '》', '（': '）', '(': ')', '[': ']', '{': '}', '【': '】'}
+        self.pair_map = {'“': '”', '《': '》', '（': '）', '(': ')', '[': ']', '{': '}'}
 
         try:
             loop = asyncio.get_running_loop()
@@ -44,7 +44,46 @@ class MemeMaster(Star):
             print(f"ERROR: Web后台启动失败: {e}")
 
     # ==========================
-    # 核心 1: 输入端防抖 (修复循环BUG)
+    # 图片压缩与处理 (优化表情包体验)
+    # ==========================
+    def compress_image(self, image_data: bytes) -> tuple[bytes, str]:
+        """
+        智能压缩：
+        1. 保持透明背景（贴纸感的关键）
+        2. 限制尺寸在 800px 以内（防止图片太大）
+        3. 返回处理后的二进制数据和文件后缀
+        """
+        try:
+            img = PILImage.open(io.BytesIO(image_data))
+            
+            # 1. 尺寸调整 (限制最大宽度 800，表情包的最佳尺寸)
+            max_width = 800
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((max_width, new_height), PILImage.Resampling.LANCZOS)
+            
+            buffer = io.BytesIO()
+            
+            # 2. 智能格式选择
+            # 如果有透明通道 (RGBA) 或 P模式(可能带透明)，保存为 PNG 以保留"贴纸"效果
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                img.save(buffer, format="PNG", optimize=True)
+                return buffer.getvalue(), ".png"
+            else:
+                # 否则转换为 RGB 并存为 JPG (省空间)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(buffer, format="JPEG", quality=80, optimize=True)
+                return buffer.getvalue(), ".jpg"
+                
+        except Exception as e:
+            print(f"图片处理失败: {e}，将保存原图")
+            # 默认给个 jpg 后缀，虽然不一定对，但能跑
+            return image_data, ".jpg" 
+
+    # ==========================
+    # 核心 1: 输入端防抖
     # ==========================
     async def _timer_coroutine(self, uid: str, duration: float):
         try:
@@ -54,30 +93,34 @@ class MemeMaster(Star):
 
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50)
     async def handle_private_msg(self, event: AstrMessageEvent):
+        # 1. 死循环熔断
+        try:
+            sender_id = str(event.message_obj.sender.user_id)
+            bot_self_id = str(self.context.get_current_provider_bot().self_id)
+            if sender_id == bot_self_id: return
+        except: pass
+
         try:
             msg_str = (event.message_str or "").strip()
-            # 过滤掉 System 提示词，防止自循环
-            if "[System]" in msg_str: return 
-
             img_url = self._get_img_url(event)
             uid = event.unified_msg_origin
 
-            # 1. 自动存图
+            # 2. 暗线：自动进货 (后台并行)
             if img_url and not msg_str and not msg_str.startswith("/"):
                 cooldown = self.local_config.get("auto_save_cooldown", 60)
                 last_save = getattr(self, "last_auto_save_time", 0)
                 if time.time() - last_save > cooldown:
-                    # 异步执行，不阻塞主线程
-                    asyncio.create_task(self.ai_evaluate_image(img_url, uid))
+                    print(f"[Meme] 暗线启动：正在后台鉴定图片...")
+                    asyncio.create_task(self.ai_evaluate_image(img_url))
 
-            # 2. 指令穿透
-            if msg_str.startswith("/") or msg_str.startswith("！"):
+            # 3. 指令穿透
+            if msg_str.startswith("/") or msg_str.startswith("！") or msg_str.startswith("!"):
                 if uid in self.sessions:
                     if self.sessions[uid].get('timer_task'): self.sessions[uid]['timer_task'].cancel()
                     self.sessions[uid]['flush_event'].set()
                 return
 
-            # 3. 防抖逻辑
+            # 4. 防抖逻辑
             debounce_time = self.local_config.get("debounce_time", 2.0)
             if debounce_time <= 0: return
 
@@ -98,33 +141,39 @@ class MemeMaster(Star):
                 'flush_event': flush_event,
                 'timer_task': timer_task
             }
-            print(f"[Meme] 收到消息，开始防抖等待...")
             await flush_event.wait()
 
+            # 场景 C: 结算 (放行给LLM聊天)
             if uid not in self.sessions: return
             s = self.sessions.pop(uid)
             merged_text = "\n".join(s['buffer']).strip()
             
-            # 4. 注入小抄 (修复格式，放在末尾更隐蔽)
-            if random.randint(1, 100) <= self.local_config.get("reply_prob", 50):
+            if not merged_text and not s['images']: return
+
+            # 注入小抄
+            if merged_text and random.randint(1, 100) <= self.local_config.get("reply_prob", 50):
                 all_tags = [i.get("tags") for i in self.data.values()]
                 if all_tags:
-                    # 随机选 20 个 tag
                     hint_tags = "、".join(random.sample(all_tags, min(20, len(all_tags))))
-                    # 使用更清晰的 System Prompt 格式，避免混淆
-                    prompt_inject = f"\n\n(System Hint: You have access to these memes: [{hint_tags}]. To send one, output exactly: MEME_TAG:tag_name inside your response)"
-                    merged_text += prompt_inject
+                    merged_text += f"\n\n[System]\nAvailable Memes: {hint_tags}\nTo use, reply: MEME_TAG:tag_name"
 
+            # 图片透传
+            new_chain = []
+            if merged_text:
+                new_chain.append(Plain(merged_text))
+            
+            for url in s['images']:
+                new_chain.append(Image.fromURL(url))
+            
             event.message_str = merged_text
-            event.message_obj.message = [Plain(merged_text)]
-            print(f"[Meme] 防抖结束，放行: {merged_text[:30]}...")
-
+            event.message_obj.message = new_chain
+            
         except Exception as e:
             print(f"ERROR inside handler: {e}")
             return
 
     # ==========================
-    # 核心 2: 输出端分段 (增强正则与容错)
+    # 核心 2: 输出端
     # ==========================
     @filter.on_decorating_result(priority=0)
     async def on_decorate(self, event: AstrMessageEvent):
@@ -146,34 +195,29 @@ class MemeMaster(Star):
         setattr(event, "__processed", True)
         
         try:
-            # 1. 增强版正则：兼容 [MEME_TAG:xxx] 和 MEME_TAG:xxx
-            # 解释：找到 MEME_TAG: 后面直到 换行、空格、]、) 结束的字符
-            mixed_chain = []
-            parts = re.split(r"(\[?MEME_TAG:[^ \n\]\)]+\]?)", text) 
+            parts = re.split(r"(MEME_TAG:[\w\u4e00-\u9fa5]+)", text)
             
+            mixed_chain = []
             has_tag = False
+            
             for part in parts:
-                clean_part = part.strip()
-                if "MEME_TAG:" in clean_part:
-                    has_tag = True
-                    # 清理 tag 中的多余符号
-                    tag = clean_part.replace("MEME_TAG:", "").replace("[", "").replace("]", "").replace("(", "").replace(")", "").strip()
+                if part.startswith("MEME_TAG:"):
+                    tag = part.replace("MEME_TAG:", "").strip()
                     path = self.find_best_match(tag)
                     if path: 
                         print(f"🎯 命中图片: {tag}")
                         mixed_chain.append(Image.fromFileSystem(path))
+                        has_tag = True
                     else:
-                        mixed_chain.append(Plain(f"[缺: {tag}]"))
-                elif clean_part:
-                    # 只有纯文本才加进去
-                    mixed_chain.append(Plain(part)) # 这里保留原始 part 以维持空格格式
+                        pass 
+                elif part:
+                    mixed_chain.append(Plain(part))
             
-            if not has_tag and len(text) < 50: return
+            if not has_tag and len(text) < 100 and "。" not in text: 
+                return 
 
-            # 2. 智能分段
             segments = self.smart_split(mixed_chain)
             
-            # 3. 拟人发送
             delay_base = self.local_config.get("delay_base", 0.5)
             delay_factor = self.local_config.get("delay_factor", 0.1)
             
@@ -187,172 +231,82 @@ class MemeMaster(Star):
                 
                 if i < len(segments) - 1: await asyncio.sleep(wait)
             
-            # 4. 完美终止原消息
             event.set_result(None)
 
         except Exception as e:
             print(f"分段发送出错: {e}")
 
     # ==========================
-    # 核心 3: 图片处理 (压缩 + 自动保存)
+    # 核心 3: 暗线 - 自动进货 (含压缩)
     # ==========================
-    def compress_image(self, file_path, quality=75):
-        """压缩图片并转换为JPG"""
-        try:
-            with PILImage.open(file_path) as img:
-                # 转换为 RGB 模式（防止 RGBA 存 JPG 报错）
-                if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-                # 限制最大尺寸，例如宽度不超过 1024
-                if img.width > 1024:
-                    ratio = 1024 / img.width
-                    new_height = int(img.height * ratio)
-                    img = img.resize((1024, new_height), PILImage.LANCZOS)
-                
-                # 覆盖保存
-                img.save(file_path, "JPEG", quality=quality)
-                return True
-        except Exception as e:
-            print(f"图片压缩失败: {e}")
-            return False
-
-    async def ai_evaluate_image(self, img_url, uid):
+    async def ai_evaluate_image(self, img_url):
         try:
             self.last_auto_save_time = time.time()
             provider = self.context.get_using_provider()
             if not provider: return
             
-            # 提示词保持不变...
-            prompt = """你正在帮我整理一个 QQ 表情包素材库...（同原代码）..."""
-            
+            # 这里是你的三引号 prompt，保持不变
+            prompt = """你正在帮我整理一个 QQ 表情包素材库。
+请判断这张图片是否“值得被保存”，
+作为未来聊天中可能会使用的表情包素材。
+配文是：“{context_text}”。
+判断时请注意：
+- 这是一个偏二次元 / meme 使用环境
+- 常见来源包括：chiikawa、这狗、线条小狗、多栋、猫meme 等
+- 不要过度严肃，也不要把普通照片当成表情包
+如果这张图不适合做表情包，请只回复：
+NO
+如果适合，请严格按下面格式回复（不要多余内容）：
+YES
+<名称>:<一句自然语言解释这个表情包在什么语境下使用>
+规则：
+1. 如果你能明确判断这是某个常见 IP、角色或 meme 系列，
+   请直接使用大家普遍认得的名字作为「名称」
+   例如：chiikawa、这狗、线条小狗、多栋、猫meme
+2. 如果无法确定具体 IP，不要强行猜测，
+   请使用一个简短的情绪或语气概括作为「名称」
+3. 冒号后必须是一句完整、自然的“使用说明”，
+   描述人在什么情况下会用这个表情包"""
+
             resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
             content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
             
-            if "YES" in content.upper():
-                tag = content.split('\n')[-1].replace("标签", "").strip() or "未分类"
-                print(f"🖤 [自动进货] {tag}")
-                
-                # 保存图片
-                saved_path = await self._save_img(img_url, tag, "auto")
-                
-                # 发送反馈给用户！
-                if saved_path:
-                    chain = MessageChain().message([Plain(f"已收录表情包：{tag}")])
-                    await self.context.send_message(uid, chain)
-                    
+            if "YES" in content:
+                lines = content.split('\n')
+                tag_line = lines[-1].strip()
+                if ":" in tag_line:
+                    tag = tag_line.split(":")[0].replace("<", "").replace(">", "").strip()
+                    desc = tag_line.split(":")[-1].strip()
+                    full_tag = f"{tag}: {desc}"
+                    print(f"🖤 [自动进货] {full_tag}")
+                    await self._save_img(img_url, full_tag, "auto")
         except Exception as e:
-            print(f"AI 审图出错: {e}")
+            print(f"鉴图出错: {e}")
 
     # ==========================
-    # Web 后台 (含进度条支持)
+    # 辅助工具
     # ==========================
-    async def start_web_server(self):
-        app = web.Application()
-        app._client_max_size = 50 * 1024 * 1024 
-        
-        app.router.add_get("/", self.h_idx)
-        app.router.add_post("/upload", self.h_up)
-        app.router.add_post("/batch_delete", self.h_del)
-        app.router.add_post("/update_tag", self.h_tag)
-        app.router.add_get("/get_config", self.h_gcf)
-        app.router.add_post("/update_config", self.h_ucf)
-        app.router.add_get("/backup", self.h_backup)
-        app.router.add_post("/restore", self.h_restore)
-        app.router.add_static("/images/", path=self.img_dir)
-        
-        runner = web.AppRunner(app); await runner.setup()
-        port = self.local_config.get("web_port", 5000)
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        print(f"WebUI: http://localhost:{port}")
-
-    # --- Handlers ---
-    async def h_idx(self,r): 
-        # 确保读取最新数据
-        return web.Response(text=self.read_file("index.html").replace("{{MEME_DATA}}", json.dumps(self.data)), content_type="text/html")
-    
-    async def h_up(self,r):
-        rd = await r.multipart(); tag="未分类"
-        while True:
-            p = await rd.next()
-            if not p: break
-            if p.name == "file":
-                fn = f"{int(time.time()*1000)}_{random.randint(100,999)}.jpg"
-                fp = os.path.join(self.img_dir, fn)
-                with open(fp, "wb") as f: f.write(await p.read())
-                
-                # 立即压缩
-                self.compress_image(fp)
-                
-                self.data[fn] = {"tags": tag, "source": "manual"}
-            elif p.name == "tags": tag = await p.text()
-        self.save_data(); return web.Response(text="ok")
-        
-    async def h_del(self,r):
-        for f in (await r.json()).get("filenames",[]):
-            try: os.remove(os.path.join(self.img_dir, f)); del self.data[f]
-            except: pass
-        self.save_data(); return web.Response(text="ok")
-        
-    async def h_tag(self,r): d=await r.json(); self.data[d['filename']]['tags']=d['tags']; self.save_data(); return web.Response(text="ok")
-    async def h_gcf(self,r): return web.json_response(self.local_config)
-    
-    async def h_ucf(self,r): 
-        new_conf = await r.json()
-        self.local_config.update(new_conf)
-        self.save_config() # 确保写入文件
-        return web.Response(text="ok")
-
-    async def h_backup(self, r):
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as z:
-            for root, _, files in os.walk(self.img_dir):
-                for file in files: z.write(os.path.join(root, file), f"images/{file}")
-            if os.path.exists(self.data_file): z.write(self.data_file, "memes.json")
-            if os.path.exists(self.config_file): z.write(self.config_file, "config.json")
-        buffer.seek(0)
-        return web.Response(body=buffer, headers={
-            'Content-Disposition': f'attachment; filename="meme_backup_{int(time.time())}.zip"',
-            'Content-Type': 'application/zip'
-        })
-
-    async def h_restore(self, r):
-        reader = await r.multipart()
-        field = await reader.next()
-        if not field or field.name != 'file': return web.Response(status=400, text="No file")
-        buffer = io.BytesIO(await field.read())
-        try:
-            with zipfile.ZipFile(buffer, 'r') as z:
-                z.extractall(self.base_dir)
-            self.data = self.load_data()
-            self.local_config = self.load_config()
-            return web.Response(text="ok")
-        except Exception as e:
-            return web.Response(status=500, text=str(e))
-
-    # --- Utils ---
     def smart_split(self, chain):
         segs = []; buf = []
+        def flush():
+            if buf: segs.append(buf[:]); buf.clear()
         for c in chain:
             if isinstance(c, Image):
-                if buf: segs.append(buf[:]); buf = []
-                segs.append([c]); continue
+                flush(); segs.append([c]); continue
             if isinstance(c, Plain):
                 txt = c.text; idx = 0; chunk = ""; stack = []
                 while idx < len(txt):
                     char = txt[idx]
                     if char in self.pair_map: stack.append(char)
                     elif stack and char == self.pair_map[stack[-1]]: stack.pop()
-                    
                     if not stack and char in "\n。？！?!":
                         chunk += char
                         if chunk.strip(): buf.append(Plain(chunk))
-                        if buf: segs.append(buf[:]); buf = []
-                        chunk = ""
-                    else:
-                        chunk += char
+                        flush(); chunk = ""
+                    else: chunk += char
                     idx += 1
                 if chunk: buf.append(Plain(chunk))
-        if buf: segs.append(buf)
+        flush()
         return segs
 
     def find_best_match(self, query):
@@ -364,25 +318,101 @@ class MemeMaster(Star):
             if s > score: score = s; best = f
         if score > 0.4: return os.path.join(self.img_dir, best)
         return None
+
+    # ==========================
+    # Web Server (应用智能压缩)
+    # ==========================
+    async def start_web_server(self):
+        app = web.Application()
+        app._client_max_size = 50 * 1024 * 1024 
+        app.router.add_get("/", self.h_idx)
+        app.router.add_post("/upload", self.h_up)
+        app.router.add_post("/batch_delete", self.h_del)
+        app.router.add_post("/update_tag", self.h_tag)
+        app.router.add_get("/get_config", self.h_gcf)
+        app.router.add_post("/update_config", self.h_ucf)
+        app.router.add_get("/backup", self.h_backup)
+        app.router.add_post("/restore", self.h_restore)
+        app.router.add_static("/images/", path=self.img_dir)
+        runner = web.AppRunner(app); await runner.setup()
+        port = self.local_config.get("web_port", 5000)
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"WebUI: http://localhost:{port}")
+
+    async def h_idx(self,r): return web.Response(text=self.read_file("index.html").replace("{{MEME_DATA}}", json.dumps(self.data)), content_type="text/html")
     
+    # 上传处理器 (应用智能压缩)
+    async def h_up(self,r):
+        rd = await r.multipart(); tag="未分类"
+        while True:
+            p = await rd.next()
+            if not p: break
+            if p.name == "file":
+                raw_data = await p.read()
+                # 智能压缩
+                compressed_data, ext = self.compress_image(raw_data)
+                
+                fn = f"{int(time.time()*1000)}_{random.randint(100,999)}{ext}"
+                with open(os.path.join(self.img_dir, fn), "wb") as f: 
+                    f.write(compressed_data)
+                    
+                self.data[fn] = {"tags": tag, "source": "manual"}
+            elif p.name == "tags": tag = await p.text()
+        self.save_data(); return web.Response(text="ok")
+        
+    async def h_del(self,r):
+        for f in (await r.json()).get("filenames",[]):
+            try: os.remove(os.path.join(self.img_dir, f)); del self.data[f]
+            except: pass
+        self.save_data(); return web.Response(text="ok")
+    async def h_tag(self,r): d=await r.json(); self.data[d['filename']]['tags']=d['tags']; self.save_data(); return web.Response(text="ok")
+    
+    async def h_gcf(self,r): return web.json_response(self.local_config)
+    async def h_ucf(self,r): 
+        new_conf = await r.json()
+        self.local_config.update(new_conf)
+        self.save_config() 
+        return web.Response(text="ok")
+
+    async def h_backup(self, r):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as z:
+            for root, _, files in os.walk(self.img_dir):
+                for file in files: z.write(os.path.join(root, file), f"images/{file}")
+            if os.path.exists(self.data_file): z.write(self.data_file, "memes.json")
+            if os.path.exists(self.config_file): z.write(self.config_file, "config.json")
+        buffer.seek(0)
+        return web.Response(body=buffer, headers={'Content-Disposition': f'attachment; filename="meme_backup_{int(time.time())}.zip"', 'Content-Type': 'application/zip'})
+
+    async def h_restore(self, r):
+        reader = await r.multipart()
+        field = await reader.next()
+        if not field or field.name != 'file': return web.Response(status=400, text="No file")
+        buffer = io.BytesIO(await field.read())
+        try:
+            with zipfile.ZipFile(buffer, 'r') as z:
+                z.extractall(self.base_dir)
+            self.data = self.load_data(); self.local_config = self.load_config()
+            return web.Response(text="ok")
+        except Exception as e: return web.Response(status=500, text=str(e))
+
     def read_file(self, n): 
         with open(os.path.join(self.base_dir, n), "r", encoding="utf-8") as f: return f.read()
-        
+    
+    # 自动进货保存 (应用智能压缩)
     async def _save_img(self, url, tag, src):
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url) as r:
-                    fn = f"{int(time.time())}.jpg"
-                    fp = os.path.join(self.img_dir, fn)
-                    with open(fp, "wb") as f: f.write(await r.read())
-                    self.compress_image(fp) # 保存时自动压缩
-                    self.data[fn] = {"tags": tag, "source": src}
-                    self.save_data()
-                    return fp
-        except Exception as e:
-            print(f"Save Img Error: {e}")
-            return None
-            
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url) as r:
+                raw_data = await r.read()
+                # 智能压缩
+                compressed_data, ext = self.compress_image(raw_data)
+                
+                fn = f"{int(time.time())}{ext}"
+                with open(os.path.join(self.img_dir, fn), "wb") as f: 
+                    f.write(compressed_data)
+                self.data[fn] = {"tags": tag, "source": src}; self.save_data()
+                
     def _get_img_url(self, e):
         for c in e.message_obj.message:
             if isinstance(c, Image): return c.url
