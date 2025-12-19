@@ -16,9 +16,9 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (v1.0.7 Final) 已加载")
+print("DEBUG: MemeMaster Pro (v1.0.8 SlimFix) 已加载")
 
-@register("vv_meme_master", "MemeMaster", "防抖+表情包+拟人分段", "1.0.7")
+@register("vv_meme_master", "MemeMaster", "防抖+表情包+拟人分段", "1.0.8")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -53,7 +53,6 @@ class MemeMaster(Star):
                 img = img.resize((max_width, new_height), PILImage.Resampling.LANCZOS)
             
             buffer = io.BytesIO()
-            # 保留透明通道
             if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
                 img.save(buffer, format="PNG", optimize=True)
                 return buffer.getvalue(), ".png"
@@ -70,7 +69,7 @@ class MemeMaster(Star):
     # ==========================
     async def download_image(self, url):
         try:
-            timeout = aiohttp.ClientTimeout(total=10) # 10秒超时
+            timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as resp:
                     if resp.status == 200: return await resp.read()
@@ -87,7 +86,6 @@ class MemeMaster(Star):
 
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50)
     async def handle_private_msg(self, event: AstrMessageEvent):
-        # 1. 熔断自己
         try:
             sender_id = str(event.message_obj.sender.user_id)
             bot_self_id = str(self.context.get_current_provider_bot().self_id)
@@ -99,7 +97,7 @@ class MemeMaster(Star):
             img_url = self._get_img_url(event)
             uid = event.unified_msg_origin
 
-            # 2. 暗线：自动进货
+            # 暗线：自动进货
             if img_url and not msg_str and not msg_str.startswith("/"):
                 cooldown = self.local_config.get("auto_save_cooldown", 60)
                 last_save = getattr(self, "last_auto_save_time", 0)
@@ -107,14 +105,14 @@ class MemeMaster(Star):
                     print(f"[Meme] 暗线启动：正在后台鉴定图片...")
                     asyncio.create_task(self.ai_evaluate_image(img_url))
 
-            # 3. 指令穿透
+            # 指令穿透
             if msg_str.startswith("/") or msg_str.startswith("！") or msg_str.startswith("!"):
                 if uid in self.sessions:
                     if self.sessions[uid].get('timer_task'): self.sessions[uid]['timer_task'].cancel()
                     self.sessions[uid]['flush_event'].set()
                 return
 
-            # 4. 防抖逻辑
+            # 防抖逻辑
             debounce_time = self.local_config.get("debounce_time", 2.0)
             if debounce_time <= 0: return
 
@@ -132,24 +130,20 @@ class MemeMaster(Star):
                 self.sessions[uid]['timer_task'] = asyncio.create_task(self._timer_coroutine(uid, debounce_time))
                 wait_task = None
 
-            # 入队：严格记录顺序
             s = self.sessions[uid]
             if msg_str: s['queue'].append({'type': 'text', 'content': msg_str})
             if img_url: s['queue'].append({'type': 'image', 'url': img_url})
 
-            event.stop_event() # 拦截
+            event.stop_event()
 
             if wait_task:
                 await wait_task
-                # --- 结算 ---
                 if uid not in self.sessions: return
                 s = self.sessions.pop(uid)
                 queue = s['queue']
                 
                 if not queue: return
 
-                # 重组消息链，严格还原 Text -> Image -> Text 的顺序
-                # 并强制压缩图片，解决“忽大忽小”问题
                 new_chain = []
                 full_text_buffer = []
 
@@ -164,7 +158,6 @@ class MemeMaster(Star):
                             comp_data, _ = self.compress_image(img_data)
                             new_chain.append(Image.fromBytes(comp_data))
                 
-                # 注入小抄 (加在最后)
                 joined_text = "\n".join(full_text_buffer)
                 if joined_text and random.randint(1, 100) <= self.local_config.get("reply_prob", 50):
                     all_tags = [i.get("tags") for i in self.data.values()]
@@ -204,7 +197,6 @@ class MemeMaster(Star):
         if not text: return
         setattr(event, "__processed", True)
         
-        # Log AI Reply
         print(f"[Meme] AI回复: {text[:50]}...")
 
         try:
@@ -233,8 +225,10 @@ class MemeMaster(Star):
             
             for i, seg in enumerate(segments):
                 txt_c = "".join([c.text for c in seg if isinstance(c, Plain)])
+                img_count = sum(1 for c in seg if isinstance(c, Image))
                 wait = delay_base + (len(txt_c) * delay_factor)
                 
+                print(f"--> 发送 (段 {i+1}): {txt_c} [图*{img_count}]")
                 mc = MessageChain()
                 mc.chain = seg
                 await self.context.send_message(event.unified_msg_origin, mc)
@@ -328,9 +322,12 @@ YES
         if score > 0.4: return os.path.join(self.img_dir, best)
         return None
 
+    # Web 服务注册
     async def start_web_server(self):
         app = web.Application()
         app._client_max_size = 50 * 1024 * 1024 
+        
+        # 注册路由
         app.router.add_get("/", self.h_idx)
         app.router.add_post("/upload", self.h_up)
         app.router.add_post("/batch_delete", self.h_del)
@@ -339,7 +336,10 @@ YES
         app.router.add_post("/update_config", self.h_ucf)
         app.router.add_get("/backup", self.h_backup)
         app.router.add_post("/restore", self.h_restore)
-        app.router.add_post("/slim_images", self.h_slim)
+        
+        # 【关键】注册瘦身接口，这下不会404了
+        app.router.add_post("/slim_images", self.h_slim) 
+        
         app.router.add_static("/images/", path=self.img_dir)
         runner = web.AppRunner(app); await runner.setup()
         port = self.local_config.get("web_port", 5000)
@@ -347,6 +347,7 @@ YES
         await site.start()
         print(f"WebUI: http://localhost:{port}")
 
+    # Handlers
     async def h_idx(self,r): return web.Response(text=self.read_file("index.html").replace("{{MEME_DATA}}", json.dumps(self.data)), content_type="text/html")
     
     async def h_up(self,r):
@@ -364,7 +365,7 @@ YES
             elif p.name == "tags": tag = await p.text()
         self.save_data(); return web.Response(text="ok")
 
-    # 一键瘦身接口
+    # 瘦身 Handler
     async def h_slim(self, r):
         count = 0
         total_saved = 0
