@@ -300,20 +300,25 @@ class MemeMaster(Star):
             provider = self.context.get_using_provider()
             if not provider: return
             
-            # 【优化】更严谨的 Prompt
-            prompt = f"""你正在帮我整理一个表情包素材库。
+            # 1. 定义默认 Prompt (作为保底)
+            default_prompt = """你正在帮我整理一个表情包素材库。
 请判断这张图片是否“值得被保存”为表情包。
-用户发送图片时附带的文字是：“{context_text}”。(请参考此上下文来判断图片的真实含义)
+用户发送图片时附带的文字是：“{context_text}”。
 
 判断规则：
-1. 这是一个偏二次元/Meme环境，但**严禁产生幻觉**。
-2. 如果图片是**企业Logo**（如Google、Gemini）、**真实照片**、**系统截图**，请如实判断，**不要**强行关联到游戏或动漫道具（严禁把星星形状误判为原石）。
-3. 如果这确实是一个表情包/梗图，请保存。
-4. 如果这只是普通图片，回复 NO。
+1. 这是一个Meme环境。
+2. 严禁幻觉：如果是企业Logo、真实照片，不要强行关联游戏或动漫。
+3. 严禁出现以下内容：
+4. 如果是表情包，请保存。否则回复 NO。
 
 如果适合保存，请回复：
 YES
 <名称>:<一句自然语言解释这个表情包在什么语境下使用>"""
+
+            # 2. 从配置读取自定义 Prompt，如果没设置就用默认的
+            # 注意：这里用 replace 而不是 f-string，防止用户输入的 { } 导致报错
+            prompt_template = self.local_config.get("ai_prompt", default_prompt)
+            prompt = prompt_template.replace("{context_text}", context_text)
 
             resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
             content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
