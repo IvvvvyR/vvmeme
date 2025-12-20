@@ -236,6 +236,11 @@
             <div id="tab-meme" class="tab-content active">
                 <div class="form-group"><label>发图概率 (%)</label><input type="number" id="conf_reply_prob"><div class="hint">每句话带图的可能性</div></div>
                 <div class="form-group"><label>存图冷却 (秒)</label><input type="number" id="conf_auto_save_cooldown"><div class="hint">防止机疯狂捡垃圾</div></div>
+                <div class="form-group"><label>鉴图提示词 (Prompt)</label>
+    <!-- 这里的 {context_text} 是必须保留的占位符 -->
+                    <textarea id="conf_ai_prompt" style="width:100%; height:150px; padding:10px; border-radius:10px; border:1px solid #cbd5e1; font-family:monospace; font-size:0.85rem; resize:vertical;"></textarea>
+                <div class="hint">必须保留 <b>{context_text}</b> 代表用户发的文字。<br>在这里狠狠地把你要禁止的东西写进去！</div>
+            </div>
                 <!-- 瘦身按钮 -->
                 <button class="btn" style="width:100%; border:1px dashed #f59e0b; color:#d97706; margin-top:10px;" onclick="slimImages()">⚡ 一键压缩旧图 (瘦身)</button>
             </div>
@@ -420,6 +425,7 @@
             ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor'].forEach(k => {
                 if(document.getElementById(`conf_${k}`)) document.getElementById(`conf_${k}`).value = c[k]??0;
             });
+            document.getElementById('conf_ai_prompt').value = c['ai_prompt'] || "你可以在这里重写默认提示词...";
             document.getElementById('settingsModal').style.display = 'flex';
         }
         
@@ -430,6 +436,8 @@
             ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor'].forEach(k => {
                 conf[k] = parseFloat(document.getElementById(`conf_${k}`).value);
             });
+            conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
+            
             await fetch('/update_config', {method:'POST', body:JSON.stringify(conf)});
             closeSettings(); showToast('配置已保存');
         }
