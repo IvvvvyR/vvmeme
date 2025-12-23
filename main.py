@@ -83,7 +83,7 @@ class MemeMaster(Star):
         return f"[当前时间: {solar_str}{lunar_str}]"
 
     # ==========================
-    # 模块 2: 寂寞主动聊
+    # 替换模块 2: 寂寞主动聊 (带静默时段)
     # ==========================
     async def _lonely_watcher(self):
         print("[Meme] 寂寞检测启动...")
@@ -92,23 +92,42 @@ class MemeMaster(Star):
             interval = self.local_config.get("proactive_interval", 0)
             if interval <= 0: continue
             
+            # 【新增】静默时段检查
+            q_start = self.local_config.get("quiet_start", -1) # -1表示不启用
+            q_end = self.local_config.get("quiet_end", -1)
+            
+            if q_start != -1 and q_end != -1:
+                current_hour = datetime.datetime.now().hour
+                # 逻辑：比如 23点到7点。
+                # 如果 start > end (跨夜)：hour >= 23 或 hour < 7 都是静默
+                # 如果 start < end (白天)：hour >= 14 且 hour < 16 是静默
+                is_quiet = False
+                if q_start > q_end: 
+                    if current_hour >= q_start or current_hour < q_end: is_quiet = True
+                else:
+                    if q_start <= current_hour < q_end: is_quiet = True
+                
+                if is_quiet:
+                    # print(f"[Meme] 当前是静默时段 ({current_hour}点)，跳过主动发送")
+                    continue
+
             if time.time() - self.last_active_time > (interval * 60):
-                # print(f"[Meme] 触发主动聊天...")
                 self.last_active_time = time.time() 
                 
                 provider = self.context.get_using_provider()
                 if provider:
-                    ctx = f"{self.get_time_str()}\n你已经很久({interval}分钟)没有和用户说话了。{self.current_summary}\n请主动发起一个话题，或者分享一个表情包。"
+                    # 读取完整的长记忆给 AI 参考
+                    full_memory = self.load_memory()
+                    ctx = f"{self.get_time_str()}\n你已经很久({interval}分钟)没有和用户说话了。\n[你的长期记忆]: {full_memory}\n请根据记忆和时间，主动发起一个不生硬的话题。"
                     try:
-                        # 尝试获取最近的 session_id
                         sid = getattr(self, "last_session_id", None)
                         resp = await provider.text_chat(ctx, session_id=sid)
                         text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
                         if text:
-                            # 尝试发给最近的 uid
                             uid = getattr(self, "last_uid", None)
                             if uid: await self.process_and_send(None, text, target_uid=uid)
                     except: pass
+
 
     # ==========================
     # 模块 3: 核心消息处理 (防抖+过滤)
@@ -228,23 +247,42 @@ class MemeMaster(Star):
             except: return ""
         return ""
 
+    # ==========================
+    # 替换模块 4: 外挂记忆 (改为追加模式)
+    # ==========================
+    # load_memory 不用改，它是读取整个文件
+
     async def check_and_summarize(self):
         threshold = self.local_config.get("summary_threshold", 50) 
         if len(self.chat_history_buffer) >= threshold:
             history_text = "\n".join(self.chat_history_buffer)
             self.chat_history_buffer = [] 
             
-            print("[Meme] 触发记忆总结...")
+            print("[Meme] 触发记忆追加...")
             provider = self.context.get_using_provider()
             if provider:
-                prompt = f"请简要总结以下对话的关键信息（不超过200字），作为长期的记忆保存：\n{history_text}"
+                now_str = self.get_time_str()
+                # 【修改点】让 AI 总结这一小段，而不是重写整个记忆
+                prompt = f"""当前时间：{now_str}
+这是用户和AI最近的{threshold}句对话。
+请将这段对话浓缩成一段“日记”，记录关键事件、用户观点或梗，以及恋爱日常。
+不要回顾太久远的历史，只总结这段对话。
+要求：简洁、带时间标记。
+
+对话内容：
+{history_text}"""
+
                 try:
                     resp = await provider.text_chat(prompt, session_id=None)
                     summary = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
                     if summary:
-                        self.current_summary = summary
-                        with open(self.memory_file, "w", encoding="utf-8") as f: f.write(summary)
-                        print(f"[Meme] 记忆已更新")
+                        # 【核心修改】使用 'a' (append) 模式追加，而不是覆盖！
+                        with open(self.memory_file, "a", encoding="utf-8") as f: 
+                            f.write(f"\n\n--- 记录时间: {now_str} ---\n{summary}")
+                        
+                        # 更新一下内存里的当前记忆，供下次对话使用
+                        self.current_summary = self.load_memory()
+                        print(f"[Meme] 记忆已追加: {summary[:20]}...")
                 except: pass
 
     # ==========================
