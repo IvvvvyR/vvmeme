@@ -29,9 +29,9 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (全功能修复版V6) 正在启动...")
+print("DEBUG: MemeMaster Pro (V9 完美缝合版) 正在启动...")
 
-@register("vv_meme_master", "MemeMaster", "全功能修复版V6", "3.6.4")
+@register("vv_meme_master", "MemeMaster", "完美缝合版V9", "3.6.7")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -57,7 +57,6 @@ class MemeMaster(Star):
         self.debounce_tasks = {}
         self.msg_buffers = {}
         
-        # 这里的 chat_history_buffer 就是用来收集对话的地方
         self.chat_history_buffer = self.load_buffer_from_disk()
         self.last_active_time = time.time()
         self.current_summary = self.load_memory()
@@ -78,9 +77,8 @@ class MemeMaster(Star):
         self.running = False 
 
     # ==========================
-    # 消息处理 (保持 V5 的稳健写法)
+    # 消息处理
     # ==========================
-    
     @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def handle_group_msg(self, event: AstrMessageEvent):
         await self._core_logic(event)
@@ -104,7 +102,6 @@ class MemeMaster(Star):
         self.last_session_id = event.session_id
         self.last_uid = uid
 
-        # [收集对话] 用户发送的消息在这里存入缓冲区
         if msg_str: 
             self.chat_history_buffer.append(f"User: {msg_str}")
             self.save_buffer_to_disk()
@@ -114,11 +111,20 @@ class MemeMaster(Star):
                 asyncio.create_task(self.ai_evaluate_image(img_url, msg_str))
 
         if msg_str.startswith(("/", "！", "!")):
+            # 指令类消息，尝试入库后放行，但不走防抖
+            await self._try_save_to_db(event)
             if uid in self.debounce_tasks: self.debounce_tasks[uid].cancel(); await self._execute_buffer(uid, event)
             return
 
         debounce_time = self.local_config.get("debounce_time", 5.0)
-        event.stop_event()
+
+        # =================================================
+        # [核心修复 V9] 在拦截事件前，手动将消息保存到 AstrBot 数据库
+        # =================================================
+        await self._try_save_to_db(event)
+        
+        # 拦截事件，阻止原生逻辑抢答
+        event.stop_event() 
         
         if debounce_time <= 0: 
             await self._execute_buffer(uid, event)
@@ -129,11 +135,21 @@ class MemeMaster(Star):
         if msg_str: self.msg_buffers[uid]['text'].append(msg_str)
         if img_url: self.msg_buffers[uid]['imgs'].append(img_url)
 
-        # [日志] 打印防抖开始
-        print(f"🕒 [Meme] 收到消息，进入防抖倒计时: {debounce_time}秒 (UID: {uid})")
+        print(f"🕒 [Meme] 收到消息，进入防抖倒计时: {debounce_time}秒")
 
         if uid in self.debounce_tasks: self.debounce_tasks[uid].cancel()
         self.debounce_tasks[uid] = asyncio.create_task(self._debounce_waiter(uid, debounce_time))
+
+    # [核心修复 V9] 辅助函数：手动入库
+    async def _try_save_to_db(self, event):
+        try:
+            cm = getattr(self.context, 'conversation_manager', None)
+            if cm:
+                await cm.save_message(event.message_obj)
+                # print("DEBUG: [Meme] 已手动将消息写入 AstrBot 数据库")
+        except Exception as e:
+            # 不阻断主流程，只打印 debug
+            print(f"DEBUG: [Meme] 消息入库失败 (可能不影响使用): {e}")
 
     async def _debounce_waiter(self, uid, duration):
         try:
@@ -144,8 +160,7 @@ class MemeMaster(Star):
     async def _execute_buffer(self, uid, force_event=None):
         if uid not in self.msg_buffers and not force_event: return
         
-        # [日志] 打印防抖结束
-        print(f"🚀 [Meme] 防抖结束，开始构建 Prompt 发送请求 (UID: {uid})")
+        print(f"🚀 [Meme] 防抖结束，开始构建回复 (UID: {uid})")
 
         if uid in self.msg_buffers:
             data = self.msg_buffers.pop(uid)
@@ -159,11 +174,20 @@ class MemeMaster(Star):
             img = self._get_img_url(event)
             if img: imgs.append(img)
         
-        # 触发记忆总结检查
         asyncio.create_task(self.check_and_summarize())
 
+        # [V8 逻辑] 自动读取人设
+        provider = self.context.get_using_provider()
+        system_persona = "你是一个智能助手。"
+        
+        if provider:
+            if getattr(provider, "system_prompt", None):
+                system_persona = provider.system_prompt
+            elif getattr(provider, "config", None) and getattr(provider.config, "system_prompt", None):
+                system_persona = provider.config.system_prompt
+
         time_info = self.get_time_str()
-        memory_info = f"\n[前情提要: {self.current_summary}]" if self.current_summary else ""
+        memory_block = f"长期记忆:\n{self.current_summary}" if self.current_summary else "长期记忆: 暂无"
         
         hint_msg = ""
         if random.randint(1, 100) <= self.local_config.get("reply_prob", 50):
@@ -173,25 +197,29 @@ class MemeMaster(Star):
                 hint_str = " ".join([f"<MEME:{h}>" for h in hints])
                 hint_msg = f"\n[可用表情包: {hint_str}]\n回复格式: <MEME:名称>"
 
-        full_prompt = f"{time_info}{memory_info}\nUser: {' '.join(texts)}{hint_msg}"
+        full_prompt = f"""[System Instruction]
+{system_persona}
+
+[Environment Info]
+Current Time: {time_info}
+{memory_block}
+
+[User Message]
+{' '.join(texts)}
+{hint_msg}"""
         
-        provider = self.context.get_using_provider()
         if provider:
             try:
                 resp = await provider.text_chat(prompt=full_prompt, session_id=event.session_id, image_urls=imgs)
                 reply = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
                 if reply: 
-                    # [收集对话] AI 回复成功，在这里存入缓冲区
                     self.chat_history_buffer.append(f"AI: {reply}")
                     self.save_buffer_to_disk()
                     await self.process_and_send(event, reply)
             except Exception as e: print(f"LLM请求失败: {e}")
 
     async def check_and_summarize(self):
-        # 只有积攒了 50 条以上才总结
         if len(self.chat_history_buffer) < 50: return
-        
-        # 复制一份当前的对话记录，准备发给 LLM
         current_batch = list(self.chat_history_buffer)
         history_text = "\n".join(current_batch)
         
@@ -202,7 +230,7 @@ class MemeMaster(Star):
         now_str = self.get_time_str()
         prompt = f"""当前时间：{now_str}
 这是最近的对话。请总结成一段“日记”，追加到长期记忆中。
-要求：包含准确时间信息，记录关键事件、用户偏好、重要梗。忽略无意义寒暄。200字以内。
+要求：包含准确时间信息，记录关键事件、用户偏好、重要事。忽略无意义寒暄。200字以内。
 对话内容：
 {history_text}"""
 
@@ -217,170 +245,14 @@ class MemeMaster(Star):
                 await asyncio.get_running_loop().run_in_executor(self.executor, write_task)
                 
                 self.current_summary = self.load_memory()
-                
-                # [关键逻辑] 只有总结成功了，才删除已经总结过的部分
                 self.chat_history_buffer = self.chat_history_buffer[len(current_batch):]
                 self.save_buffer_to_disk()
-                
-                # [日志] 打印总结成功
-                print(f"✅ [Meme] 记忆总结成功！已写入 memory.txt，并清理了 {len(current_batch)} 条缓存")
+                print(f"✅ [Meme] 记忆总结成功！已写入 memory.txt")
         except Exception as e:
-            print(f"❌ [Meme] 总结失败 ({e})，暂不清理缓存")
-            # 兜底保护：如果积压太多(>100)，强制删除最早的50条，防止内存溢出
+            print(f"❌ [Meme] 总结失败 ({e})")
             if len(self.chat_history_buffer) > 100:
-                print("⚠️ [Meme] 缓存积压过多，触发强制清理逻辑")
                 self.chat_history_buffer = self.chat_history_buffer[-50:]
                 self.save_buffer_to_disk()
-
-    # ==========================
-    # Web 服务
-    # ==========================
-    async def start_web_server(self):
-        try:
-            app = web.Application()
-            app._client_max_size = 1024 * 1024 * 1024 
-            
-            app.router.add_get("/", self.h_idx)
-            app.router.add_post("/upload", self.h_up)
-            app.router.add_post("/batch_delete", self.h_del)
-            app.router.add_post("/update_tag", self.h_tag)
-            app.router.add_get("/get_config", self.h_gcf)
-            app.router.add_post("/update_config", self.h_ucf)
-            app.router.add_get("/backup", self.h_backup)
-            app.router.add_post("/restore", self.h_restore)
-            app.router.add_post("/slim_images", self.h_slim)
-            app.router.add_static("/images/", path=self.img_dir)
-            
-            runner = web.AppRunner(app)
-            await runner.setup()
-            port = self.local_config.get("web_port", 5000)
-            site = web.TCPSite(runner, "0.0.0.0", port)
-            await site.start()
-            print(f"DEBUG: [Meme] WebUI 已启动在端口 {port}")
-        except Exception as e:
-            print(f"ERROR: [Meme] WebUI 启动失败: {e}")
-
-    async def h_idx(self, r): 
-        if not self.check_auth(r): return web.Response(status=403, text="Need ?token=xxx")
-        try:
-            current_token = self.local_config.get("web_token", "admin123")
-            html = self.read_file("index.html") \
-                .replace("{{MEME_DATA}}", json.dumps(self.data)) \
-                .replace("admin123", current_token) 
-        except:
-            html = "Error: index.html not found"
-        return web.Response(
-            text=html, 
-            content_type="text/html",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
-        )
-
-    async def h_gcf(self, r):
-        return web.json_response(self.local_config)
-
-    async def h_restore(self, r):
-        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        try:
-            reader = await r.multipart()
-            field = await reader.next()
-            if not field or field.name != 'file': return web.Response(status=400, text="No file")
-            
-            file_data = await field.read()
-            def unzip_action():
-                with zipfile.ZipFile(io.BytesIO(file_data), 'r') as z:
-                    z.extractall(self.base_dir)
-
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self.executor, unzip_action)
-
-            self.data = self.load_data()
-            self.local_config = self.load_config()
-            asyncio.create_task(self._init_image_hashes())
-            return web.Response(text="ok")
-        except Exception as e:
-            return web.Response(status=500, text=str(e))
-
-    async def _init_image_hashes(self):
-        loop = asyncio.get_running_loop()
-        count = 0
-        if not os.path.exists(self.img_dir): return
-
-        files = os.listdir(self.img_dir)
-        for f in files:
-            if not f.lower().endswith(('.jpg', '.png', '.jpeg', '.gif', '.webp')): continue
-            path = os.path.join(self.img_dir, f)
-            try:
-                with open(path, "rb") as fl: 
-                    content = fl.read()
-                    h = await loop.run_in_executor(self.executor, self.calc_dhash, content)
-                    if h: 
-                        self.img_hashes[f] = h
-                        count += 1
-            except: pass
-        print(f"DEBUG: [Meme] 哈希索引构建完成，有效: {count}")
-
-    async def h_up(self, r): 
-        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        try:
-            reader = await r.multipart()
-            default_tag = "未分类"
-            count = 0
-            while True:
-                part = await reader.next()
-                if part is None: break
-                if part.name == "tags":
-                    default_tag = await part.text()
-                elif part.name == "file":
-                    file_data = await part.read()
-                    loop = asyncio.get_running_loop()
-                    h = await loop.run_in_executor(self.executor, self.calc_dhash, file_data)
-                    comp_data, ext = await loop.run_in_executor(self.executor, self.compress_image_sync, file_data)
-                    fn = f"{int(time.time()*1000)}_{random.randint(100,999)}{ext}"
-                    with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(comp_data)
-                    self.data[fn] = {"tags": default_tag, "source": "manual"}
-                    if h: self.img_hashes[fn] = h
-                    count += 1
-            self.save_data()
-            return web.Response(text="ok")
-        except Exception as e: return web.Response(status=500, text=str(e))
-
-    async def _lonely_watcher(self):
-        while self.running: 
-            await asyncio.sleep(60) 
-            interval = self.local_config.get("proactive_interval", 0)
-            if interval <= 0: continue
-            
-            q_start = self.local_config.get("quiet_start", -1)
-            q_end = self.local_config.get("quiet_end", -1)
-            if q_start != -1 and q_end != -1:
-                h = datetime.datetime.now().hour
-                is_quiet = False
-                if q_start > q_end: 
-                    if h >= q_start or h < q_end: is_quiet = True
-                else:
-                    if q_start <= h < q_end: is_quiet = True
-                if is_quiet: continue
-
-            if time.time() - self.last_active_time > (interval * 60):
-                self.last_active_time = time.time() 
-                provider = self.context.get_using_provider()
-                uid = getattr(self, "last_uid", None)
-                if provider and uid:
-                    full_memory = self.load_memory()
-                    ctx = f"{self.get_time_str()}\n你已经很久({interval}分钟)没有和用户说话了。\n[你的长期记忆]: {full_memory}\n请根据记忆和时间，主动发起一个不生硬的话题。"
-                    try:
-                        resp = await provider.text_chat(ctx, session_id=getattr(self, "last_session_id", None))
-                        text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-                        if text:
-                            self.chat_history_buffer.append(f"AI: {text}")
-                            self.save_buffer_to_disk()
-                            await self.process_and_send(None, text, target_uid=uid)
-                    except Exception as e:
-                        print(f"WARN: [Meme] 主动聊天失败: {e}")
 
     async def process_and_send(self, event, text, target_uid=None):
         text = text.replace("**", "").replace("### ", "")
@@ -539,69 +411,110 @@ class MemeMaster(Star):
             if isinstance(c, Image): return c.url
         return None
 
-    def load_config(self):
-        default_config = {
-            "web_port": 5000,
-            "debounce_time": 5.0,
-            "reply_prob": 50,
-            "proactive_interval": 0,
-            "summary_threshold": 50
-        }
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
-                    default_config.update(loaded)
-            except: pass
-        return default_config
-
-    def save_config(self):
-        with open(self.config_file, "w", encoding='utf-8') as f:
-            json.dump(self.local_config, f, indent=2)
-
-    def load_data(self):
-        if os.path.exists(self.data_file):
-            try:
-                with open(self.data_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except: pass
-        return {}
-
-    def save_data(self):
-        with open(self.data_file, "w", encoding='utf-8') as f:
-            json.dump(self.data, f, ensure_ascii=False)
-
-    def load_buffer_from_disk(self):
-        if os.path.exists(self.buffer_file):
-            try:
-                with open(self.buffer_file, "r", encoding='utf-8') as f:
-                    return json.load(f)
-            except: pass
-        return []
-
-    def save_buffer_to_disk(self):
+    # ==========================
+    # Web 服务 (部分辅助函数)
+    # ==========================
+    async def start_web_server(self):
         try:
-            with open(self.buffer_file, "w", encoding='utf-8') as f:
-                json.dump(self.chat_history_buffer, f, ensure_ascii=False)
-        except: pass
+            app = web.Application()
+            app._client_max_size = 1024 * 1024 * 1024 
+            
+            app.router.add_get("/", self.h_idx)
+            app.router.add_post("/upload", self.h_up)
+            app.router.add_post("/batch_delete", self.h_del)
+            app.router.add_post("/update_tag", self.h_tag)
+            app.router.add_get("/get_config", self.h_gcf)
+            app.router.add_post("/update_config", self.h_ucf)
+            app.router.add_get("/backup", self.h_backup)
+            app.router.add_post("/restore", self.h_restore)
+            app.router.add_post("/slim_images", self.h_slim)
+            app.router.add_static("/images/", path=self.img_dir)
+            
+            runner = web.AppRunner(app)
+            await runner.setup()
+            port = self.local_config.get("web_port", 5000)
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            print(f"DEBUG: [Meme] WebUI 已启动在端口 {port}")
+        except Exception as e:
+            print(f"ERROR: [Meme] WebUI 启动失败: {e}")
 
-    def load_memory(self):
-        if os.path.exists(self.memory_file):
-            try:
-                with open(self.memory_file, "r", encoding="utf-8") as f:
-                    return f.read()
-            except: pass
-        return ""
-
-    def read_file(self, n):
+    async def h_idx(self, r): 
+        if not self.check_auth(r): return web.Response(status=403, text="Need ?token=xxx")
         try:
-            with open(os.path.join(self.base_dir, n), "r", encoding="utf-8") as f:
-                return f.read()
-        except: return ""
-
-    def check_auth(self, r):
-        return r.query.get("token") == self.local_config.get("web_token")
-
+            current_token = self.local_config.get("web_token", "admin123")
+            html = self.read_file("index.html") \
+                .replace("{{MEME_DATA}}", json.dumps(self.data)) \
+                .replace("admin123", current_token) 
+        except:
+            html = "Error: index.html not found"
+        return web.Response(
+            text=html, 
+            content_type="text/html",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+        )
+    async def h_gcf(self, r): return web.json_response(self.local_config)
+    async def h_ucf(self, r): 
+        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
+        try:
+            self.local_config.update(await r.json())
+            self.save_config()
+            return web.Response(text="ok")
+        except: return web.Response(status=500)
+    async def h_restore(self, r):
+        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
+        try:
+            reader = await r.multipart()
+            field = await reader.next()
+            if not field or field.name != 'file': return web.Response(status=400, text="No file")
+            file_data = await field.read()
+            def unzip_action():
+                with zipfile.ZipFile(io.BytesIO(file_data), 'r') as z: z.extractall(self.base_dir)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self.executor, unzip_action)
+            self.data = self.load_data()
+            self.local_config = self.load_config()
+            asyncio.create_task(self._init_image_hashes())
+            return web.Response(text="ok")
+        except Exception as e: return web.Response(status=500, text=str(e))
+    async def _init_image_hashes(self):
+        loop = asyncio.get_running_loop()
+        if not os.path.exists(self.img_dir): return
+        files = os.listdir(self.img_dir)
+        for f in files:
+            if not f.lower().endswith(('.jpg', '.png', '.jpeg', '.gif', '.webp')): continue
+            path = os.path.join(self.img_dir, f)
+            try:
+                with open(path, "rb") as fl: 
+                    content = fl.read()
+                    h = await loop.run_in_executor(self.executor, self.calc_dhash, content)
+                    if h: self.img_hashes[f] = h
+            except: pass
+    async def h_up(self, r): 
+        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
+        try:
+            reader = await r.multipart()
+            default_tag = "未分类"
+            while True:
+                part = await reader.next()
+                if part is None: break
+                if part.name == "tags": default_tag = await part.text()
+                elif part.name == "file":
+                    file_data = await part.read()
+                    loop = asyncio.get_running_loop()
+                    h = await loop.run_in_executor(self.executor, self.calc_dhash, file_data)
+                    comp_data, ext = await loop.run_in_executor(self.executor, self.compress_image_sync, file_data)
+                    fn = f"{int(time.time()*1000)}_{random.randint(100,999)}{ext}"
+                    with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(comp_data)
+                    self.data[fn] = {"tags": default_tag, "source": "manual"}
+                    if h: self.img_hashes[fn] = h
+            self.save_data()
+            return web.Response(text="ok")
+        except Exception as e: return web.Response(status=500, text=str(e))
     async def h_del(self,r):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         try:
@@ -611,7 +524,6 @@ class MemeMaster(Star):
             self.save_data()
             return web.Response(text="ok")
         except: return web.Response(status=500)
-
     async def h_tag(self,r): 
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         try:
@@ -621,15 +533,6 @@ class MemeMaster(Star):
                 self.save_data()
             return web.Response(text="ok")
         except: return web.Response(status=500)
-
-    async def h_ucf(self,r): 
-        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        try:
-            self.local_config.update(await r.json())
-            self.save_config()
-            return web.Response(text="ok")
-        except: return web.Response(status=500)
-
     async def h_backup(self,r):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         try:
@@ -643,7 +546,6 @@ class MemeMaster(Star):
             b.seek(0)
             return web.Response(body=b, headers={'Content-Disposition':'attachment; filename="bk.zip"'})
         except: return web.Response(status=500)
-
     async def h_slim(self,r):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         loop = asyncio.get_running_loop(); count=0
@@ -657,3 +559,45 @@ class MemeMaster(Star):
                     count+=1
             except: pass
         return web.Response(text=f"优化了 {count} 张")
+    
+    def load_config(self):
+        default_config = {
+            "web_port": 5000,
+            "debounce_time": 5.0,
+            "reply_prob": 50,
+            "proactive_interval": 0,
+            "summary_threshold": 50
+        }
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if 'persona' in loaded: del loaded['persona']
+                    default_config.update(loaded)
+            except: pass
+        return default_config
+    def save_config(self):
+        with open(self.config_file, "w", encoding='utf-8') as f: json.dump(self.local_config, f, indent=2)
+    def load_data(self):
+        if os.path.exists(self.data_file):
+            try: return json.load(open(self.data_file, 'r', encoding='utf-8'))
+            except: pass
+        return {}
+    def save_data(self): json.dump(self.data, open(self.data_file,"w",encoding='utf-8'), ensure_ascii=False)
+    def load_buffer_from_disk(self):
+        if os.path.exists(self.buffer_file):
+            try: return json.load(open(self.buffer_file, "r", encoding='utf-8'))
+            except: pass
+        return []
+    def save_buffer_to_disk(self):
+        try: json.dump(self.chat_history_buffer, open(self.buffer_file, "w", encoding='utf-8'), ensure_ascii=False)
+        except: pass
+    def load_memory(self):
+        if os.path.exists(self.memory_file):
+            try: return open(self.memory_file, "r", encoding="utf-8").read()
+            except: pass
+        return ""
+    def read_file(self, n):
+        try: return open(os.path.join(self.base_dir, n), "r", encoding="utf-8").read()
+        except: return ""
+    def check_auth(self, r): return r.query.get("token") == self.local_config.get("web_token")
