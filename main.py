@@ -14,22 +14,27 @@ from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
 from PIL import Image as PILImage
 
-# 尝试导入 lunar_python
+# 调试打印：阴历库检测
+HAS_LUNAR = False
 try:
     from lunar_python import Lunar, Solar
     HAS_LUNAR = True
+    print("DEBUG: [Meme] 阴历库 (lunar_python) 加载成功")
 except ImportError:
     HAS_LUNAR = False
-    print("【提示】未安装 lunar_python，将只显示阳历时间。")
+    print("DEBUG: [Meme] 未检测到 lunar_python，将只显示阳历 (这不影响核心功能)")
+except Exception as e:
+    HAS_LUNAR = False
+    print(f"DEBUG: [Meme] 阴历库加载出错: {e}")
 
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (v2.0 Final Perfect) 已加载")
+print("DEBUG: MemeMaster Pro (v3.0 Final Stable) 正在启动...")
 
-@register("vv_meme_master", "MemeMaster", "全功能+内存优化+完美备份", "2.0.0")
+@register("vv_meme_master", "MemeMaster", "最终稳定版", "3.0.0")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -40,7 +45,7 @@ class MemeMaster(Star):
         self.memory_file = os.path.join(self.base_dir, "memory.txt") 
         self.buffer_file = os.path.join(self.base_dir, "buffer.json") 
         
-        # 【内存保护】强制单线程
+        # 1. 内存保护：单线程
         self.executor = ThreadPoolExecutor(max_workers=1)
         
         if not os.path.exists(self.img_dir): os.makedirs(self.img_dir, exist_ok=True)
@@ -52,10 +57,10 @@ class MemeMaster(Star):
 
         self.data = self.load_data()
         self.img_hashes = {}
-        
         self.debounce_tasks = {}
         self.msg_buffers = {}
         
+        # 2. 恢复缓存
         self.chat_history_buffer = self.load_buffer_from_disk()
         self.last_active_time = time.time()
         self.current_summary = self.load_memory()
@@ -63,16 +68,95 @@ class MemeMaster(Star):
         self.left_pairs = {'“': '”', '《': '》', '（': '）', '(': ')', '[': ']', '{': '}'}
         self.right_pairs = {v: k for k, v in self.left_pairs.items()}
 
+        # 3. 启动任务
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self.start_web_server())
             loop.create_task(self._init_image_hashes())
             loop.create_task(self._lonely_watcher())
+            print("DEBUG: [Meme] 所有后台任务已提交")
         except Exception as e:
-            print(f"ERROR: 启动任务失败: {e}")
+            print(f"ERROR: [Meme] 任务启动失败: {e}")
 
     # ==========================
-    # 基础 I/O
+    # 核心：最稳的上传逻辑
+    # ==========================
+    async def h_up(self, r): 
+        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
+        try:
+            reader = await r.multipart()
+            default_tag = "未分类"
+            count = 0
+            
+            while True:
+                part = await reader.next()
+                if part is None: break
+                
+                if part.name == "tags":
+                    default_tag = await part.text()
+                    continue
+
+                if part.name == "file":
+                    # 读取图片数据
+                    file_data = await part.read()
+                    if not file_data: continue
+
+                    # 放入线程池处理，防止阻塞
+                    loop = asyncio.get_running_loop()
+                    
+                    # 计算哈希
+                    h = await loop.run_in_executor(self.executor, self.calc_dhash, file_data)
+                    # 压缩
+                    compressed_data, ext = await loop.run_in_executor(self.executor, self.compress_image_sync, file_data)
+                    
+                    fn = f"{int(time.time()*1000)}_{random.randint(100,999)}{ext}"
+                    with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(compressed_data)
+                    
+                    self.data[fn] = {"tags": default_tag, "source": "manual"}
+                    if h: self.img_hashes[fn] = h
+                    count += 1
+                    
+                    # 释放内存
+                    del file_data, compressed_data
+                    gc.collect()
+
+            self.save_data()
+            print(f"DEBUG: [Meme] 成功上传 {count} 张图片")
+            return web.Response(text="ok")
+        except Exception as e:
+            print(f"ERROR: [Meme] 上传失败: {e}")
+            return web.Response(status=500, text=f"Upload Error: {str(e)}")
+
+    # ==========================
+    # Web 服务
+    # ==========================
+    async def start_web_server(self):
+        try:
+            app = web.Application()
+            app._client_max_size = 50 * 1024 * 1024 # 50MB 限制
+            
+            app.router.add_get("/", self.h_idx)
+            app.router.add_post("/upload", self.h_up)
+            app.router.add_post("/batch_delete", self.h_del)
+            app.router.add_post("/update_tag", self.h_tag)
+            app.router.add_get("/get_config", self.h_gcf)
+            app.router.add_post("/update_config", self.h_ucf)
+            app.router.add_get("/backup", self.h_backup)
+            app.router.add_post("/restore", self.h_restore)
+            app.router.add_post("/slim_images", self.h_slim)
+            app.router.add_static("/images/", path=self.img_dir)
+            
+            runner = web.AppRunner(app)
+            await runner.setup()
+            port = self.local_config.get("web_port", 5000)
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            print(f"DEBUG: [Meme] WebUI 已启动在端口 {port}")
+        except Exception as e:
+            print(f"ERROR: [Meme] WebUI 启动失败: {e}")
+
+    # ==========================
+    # 其他功能 (保持不变)
     # ==========================
     def load_buffer_from_disk(self):
         if os.path.exists(self.buffer_file):
@@ -102,11 +186,8 @@ class MemeMaster(Star):
             except: pass
         return f"[当前时间: {solar_str}{lunar_str}]"
 
-    # ==========================
-    # 寂寞主动聊
-    # ==========================
     async def _lonely_watcher(self):
-        print("[Meme] 寂寞检测启动...")
+        # ... (保持之前的逻辑不变)
         while True:
             await asyncio.sleep(60) 
             interval = self.local_config.get("proactive_interval", 0)
@@ -140,9 +221,6 @@ class MemeMaster(Star):
                             await self.process_and_send(None, text, target_uid=uid)
                     except: pass
 
-    # ==========================
-    # 消息处理
-    # ==========================
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50)
     async def handle_private_msg(self, event: AstrMessageEvent):
         try:
@@ -231,9 +309,6 @@ class MemeMaster(Star):
                     await self.process_and_send(event, reply)
             except Exception as e: print(f"LLM请求失败: {e}")
 
-    # ==========================
-    # 记忆系统
-    # ==========================
     def load_memory(self):
         if os.path.exists(self.memory_file):
             try: return open(self.memory_file, "r", encoding="utf-8").read()
@@ -279,9 +354,6 @@ class MemeMaster(Star):
                 self.chat_history_buffer = self.chat_history_buffer[threshold:]
                 self.save_buffer_to_disk()
 
-    # ==========================
-    # 发送处理
-    # ==========================
     async def process_and_send(self, event, text, target_uid=None):
         text = text.replace("**", "").replace("### ", "")
         print(f"[Meme] AI回复: {text[:30]}...")
@@ -346,9 +418,6 @@ class MemeMaster(Star):
         if buf: segs.append(buf)
         return segs
 
-    # ==========================
-    # 图片处理
-    # ==========================
     def compress_image_sync(self, image_data: bytes) -> tuple[bytes, str]:
         try:
             img = PILImage.open(io.BytesIO(image_data))
@@ -468,37 +537,10 @@ class MemeMaster(Star):
         if token == self.local_config.get("web_token"): return True
         return False
 
-    async def start_web_server(self):
-        app = web.Application(); app._client_max_size = 50*1024*1024
-        app.router.add_get("/", self.h_idx); app.router.add_post("/upload", self.h_up)
-        app.router.add_post("/batch_delete", self.h_del); app.router.add_post("/update_tag", self.h_tag)
-        app.router.add_get("/get_config", self.h_gcf); app.router.add_post("/update_config", self.h_ucf)
-        app.router.add_get("/backup", self.h_backup); app.router.add_post("/restore", self.h_restore)
-        app.router.add_post("/slim_images", self.h_slim); app.router.add_static("/images/", path=self.img_dir)
-        runner = web.AppRunner(app); await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.local_config.get("web_port", 5000))
-        await site.start(); print(f"WebUI running")
-    
     async def h_idx(self,r): 
         if not self.check_auth(r): return web.Response(status=403, text="Need ?token=xxx")
         return web.Response(text=self.read_file("index.html").replace("{{MEME_DATA}}", json.dumps(self.data)), content_type="text/html")
-    async def h_up(self,r): 
-        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        rd=await r.multipart(); t="未分类"
-        while True:
-            p=await rd.next()
-            if not p: break
-            if p.name=="file":
-                d=await p.read()
-                l=asyncio.get_running_loop()
-                h=await l.run_in_executor(self.executor, self.calc_dhash, d)
-                c,e=await l.run_in_executor(self.executor, self.compress_image_sync, d)
-                fn=f"{int(time.time()*1000)}_{random.randint(100,999)}{e}"
-                with open(os.path.join(self.img_dir, fn),"wb") as f: f.write(c)
-                self.data[fn]={"tags":t,"source":"manual"}
-                if h: self.img_hashes[fn]=h
-            elif p.name=="tags": t=await p.text()
-        self.save_data(); return web.Response(text="ok")
+    
     async def h_del(self,r):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         for f in (await r.json()).get("filenames",[]):
@@ -515,7 +557,6 @@ class MemeMaster(Star):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         self.local_config.update(await r.json()); self.save_config(); return web.Response(text="ok")
     
-    # 【已修复】现在可以备份记忆文件和配置文件了
     async def h_backup(self,r):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         b=io.BytesIO()
@@ -523,8 +564,8 @@ class MemeMaster(Star):
             for root,_,files in os.walk(self.img_dir): 
                 for f in files: z.write(os.path.join(root,f),f"images/{f}")
             if os.path.exists(self.data_file): z.write(self.data_file,"memes.json")
-            if os.path.exists(self.memory_file): z.write(self.memory_file,"memory.txt") # 备份记忆
-            if os.path.exists(self.config_file): z.write(self.config_file,"config.json") # 备份配置
+            if os.path.exists(self.memory_file): z.write(self.memory_file,"memory.txt") 
+            if os.path.exists(self.config_file): z.write(self.config_file,"config.json") 
         b.seek(0); return web.Response(body=b, headers={'Content-Disposition':'attachment; filename="bk.zip"'})
     
     async def h_restore(self,r):
