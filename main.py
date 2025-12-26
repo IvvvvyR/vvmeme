@@ -29,9 +29,9 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (全功能修复版V3) 正在启动...")
+print("DEBUG: MemeMaster Pro (全功能修复版V4) 正在启动...")
 
-@register("vv_meme_master", "MemeMaster", "全功能修复版V3", "3.6.1")
+@register("vv_meme_master", "MemeMaster", "全功能修复版V4", "3.6.2")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -227,7 +227,6 @@ class MemeMaster(Star):
                     except Exception as e:
                         print(f"WARN: [Meme] 主动聊天失败: {e}")
 
-    # [修复] 叠加装饰器以同时支持群聊和私聊，并修复 AttributeError
     @filter.event_message_type(EventMessageType.GROUP_MESSAGE, priority=50)
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50) 
     async def handle_msg(self, event: AstrMessageEvent):
@@ -254,7 +253,6 @@ class MemeMaster(Star):
             if time.time() - getattr(self, "last_auto_save_time", 0) > self.local_config.get("auto_save_cooldown", 60):
                 asyncio.create_task(self.ai_evaluate_image(img_url, msg_str))
 
-        # 指令处理
         if msg_str.startswith(("/", "！", "!")):
             if uid in self.debounce_tasks: self.debounce_tasks[uid].cancel(); await self._execute_buffer(uid, event)
             return
@@ -303,7 +301,7 @@ class MemeMaster(Star):
         provider = self.context.get_using_provider()
         if provider:
             try:
-                # [核心修复] 使用 prompt 参数名，防止 400 错误
+                # 修复: 增加 prompt= 防止参数解析错误
                 resp = await provider.text_chat(prompt=full_prompt, session_id=event.session_id, image_urls=imgs)
                 reply = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
                 if reply: 
@@ -444,7 +442,6 @@ class MemeMaster(Star):
             prompt = self.local_config.get("ai_prompt", default_prompt).replace("{context_text}", context_text)
             
             sid = getattr(self, "last_session_id", None)
-            # [核心修复] 使用 prompt 参数名
             resp = await provider.text_chat(prompt=prompt, session_id=sid, image_urls=[img_url])
             content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
             if "YES" in content:
@@ -505,38 +502,123 @@ class MemeMaster(Star):
         for c in e.message_obj.message:
             if isinstance(c, Image): return c.url
         return None
-    def load_config(self): return {**{"web_port":5000,"debounce_time":5.0,"reply_prob":50,"proactive_interval":0,"summary_threshold":50}, **(json.load(open(self.config_file)) if os.path.exists(self.config_file) else {})}
-    def save_config(self): json.dump(self.local_config, open(self.config_file,"w"), indent=2)
-    def load_data(self): return json.load(open(self.data_file)) if os.path.exists(self.data_file) else {}
-    def save_data(self): json.dump(self.data, open(self.data_file,"w"), ensure_ascii=False)
+
+    # 以下辅助函数已展开，防止 SyntaxError
+    def load_config(self):
+        default_config = {
+            "web_port": 5000,
+            "debounce_time": 5.0,
+            "reply_prob": 50,
+            "proactive_interval": 0,
+            "summary_threshold": 50
+        }
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    default_config.update(loaded)
+            except: pass
+        return default_config
+
+    def save_config(self):
+        with open(self.config_file, "w", encoding='utf-8') as f:
+            json.dump(self.local_config, f, indent=2)
+
+    def load_data(self):
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except: pass
+        return {}
+
+    def save_data(self):
+        with open(self.data_file, "w", encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False)
+
     def load_buffer_from_disk(self):
-        try: return json.load(open(self.buffer_file, "r"))
-        except: return []
+        if os.path.exists(self.buffer_file):
+            try:
+                with open(self.buffer_file, "r", encoding='utf-8') as f:
+                    return json.load(f)
+            except: pass
+        return []
+
     def save_buffer_to_disk(self):
-        try: json.dump(self.chat_history_buffer, open(self.buffer_file, "w"), ensure_ascii=False)
+        try:
+            with open(self.buffer_file, "w", encoding='utf-8') as f:
+                json.dump(self.chat_history_buffer, f, ensure_ascii=False)
         except: pass
+
     def load_memory(self):
-        try: return open(self.memory_file, "r", encoding="utf-8").read()
+        if os.path.exists(self.memory_file):
+            try:
+                with open(self.memory_file, "r", encoding="utf-8") as f:
+                    return f.read()
+            except: pass
+        return ""
+
+    def read_file(self, n):
+        try:
+            with open(os.path.join(self.base_dir, n), "r", encoding="utf-8") as f:
+                return f.read()
         except: return ""
-    def read_file(self, n): return open(os.path.join(self.base_dir, n), "r", encoding="utf-8").read()
-    def check_auth(self, r): return r.query.get("token") == self.local_config.get("web_token")
+
+    def check_auth(self, r):
+        return r.query.get("token") == self.local_config.get("web_token")
 
     async def h_del(self,r):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        for f in (await r.json()).get("filenames",[]):
-            try: os.remove(os.path.join(self.img_dir,f)); del self.data[f]
-            except: pass
-        self.save_data(); return web.Response(text="ok")
+        try:
+            for f in (await r.json()).get("filenames",[]):
+                try: os.remove(os.path.join(self.img_dir,f)); del self.data[f]
+                except: pass
+            self.save_data()
+            return web.Response(text="ok")
+        except: return web.Response(status=500)
+
     async def h_tag(self,r): 
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        d=await r.json(); self.data[d['filename']]['tags']=d['tags']; self.save_data(); return web.Response(text="ok")
+        try:
+            d = await r.json()
+            if d['filename'] in self.data:
+                self.data[d['filename']]['tags'] = d['tags']
+                self.save_data()
+            return web.Response(text="ok")
+        except: return web.Response(status=500)
+
     async def h_ucf(self,r): 
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        self.local_config.update(await r.json()); self.save_config(); return web.Response(text="ok")
+        try:
+            self.local_config.update(await r.json())
+            self.save_config()
+            return web.Response(text="ok")
+        except: return web.Response(status=500)
+
     async def h_backup(self,r):
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
-        b=io.BytesIO()
-        with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
-            for root,_,files in os.walk(self.img_dir): 
-                for f in files: z.write(os.path.join(root,f),f"images/{f}")
-            if os.path.exists(self.d
+        try:
+            b = io.BytesIO()
+            with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
+                for root,_,files in os.walk(self.img_dir): 
+                    for f in files: z.write(os.path.join(root,f),f"images/{f}")
+                if os.path.exists(self.data_file): z.write(self.data_file,"memes.json")
+                if os.path.exists(self.memory_file): z.write(self.memory_file,"memory.txt") 
+                if os.path.exists(self.config_file): z.write(self.config_file,"config.json") 
+            b.seek(0)
+            return web.Response(body=b, headers={'Content-Disposition':'attachment; filename="bk.zip"'})
+        except: return web.Response(status=500)
+
+    async def h_slim(self,r):
+        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
+        loop = asyncio.get_running_loop(); count=0
+        for f in os.listdir(self.img_dir):
+            try:
+                p=os.path.join(self.img_dir,f)
+                with open(p,'rb') as fl: raw=fl.read()
+                nd, _ = await loop.run_in_executor(self.executor, self.compress_image_sync, raw)
+                if len(nd)<len(raw): 
+                    with open(p,'wb') as fl: fl.write(nd)
+                    count+=1
+            except: pass
+        return web.Response(text=f"优化了 {count} 张")
