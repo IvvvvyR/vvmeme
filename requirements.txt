@@ -1,1 +1,3 @@
 aiohttp
+Pillow
+lunar_python
