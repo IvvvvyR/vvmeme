@@ -29,9 +29,9 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (全功能修复版V4) 正在启动...")
+print("DEBUG: MemeMaster Pro (全功能修复版V6) 正在启动...")
 
-@register("vv_meme_master", "MemeMaster", "全功能修复版V4", "3.6.2")
+@register("vv_meme_master", "MemeMaster", "全功能修复版V6", "3.6.4")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -42,7 +42,6 @@ class MemeMaster(Star):
         self.memory_file = os.path.join(self.base_dir, "memory.txt") 
         self.buffer_file = os.path.join(self.base_dir, "buffer.json") 
         
-        # 线程池：保护主线程不被IO操作卡死
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.running = True 
         
@@ -58,6 +57,7 @@ class MemeMaster(Star):
         self.debounce_tasks = {}
         self.msg_buffers = {}
         
+        # 这里的 chat_history_buffer 就是用来收集对话的地方
         self.chat_history_buffer = self.load_buffer_from_disk()
         self.last_active_time = time.time()
         self.current_summary = self.load_memory()
@@ -76,6 +76,161 @@ class MemeMaster(Star):
 
     def __del__(self):
         self.running = False 
+
+    # ==========================
+    # 消息处理 (保持 V5 的稳健写法)
+    # ==========================
+    
+    @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
+    async def handle_group_msg(self, event: AstrMessageEvent):
+        await self._core_logic(event)
+
+    @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE)
+    async def handle_private_msg(self, event: AstrMessageEvent):
+        await self._core_logic(event)
+
+    async def _core_logic(self, event: AstrMessageEvent):
+        try:
+            if str(event.message_obj.sender.user_id) == str(self.context.get_current_provider_bot().self_id): return
+        except: pass
+
+        msg_str = (event.message_str or "").strip()
+        img_url = self._get_img_url(event)
+        uid = event.unified_msg_origin
+
+        if not msg_str and not img_url: return
+
+        self.last_active_time = time.time()
+        self.last_session_id = event.session_id
+        self.last_uid = uid
+
+        # [收集对话] 用户发送的消息在这里存入缓冲区
+        if msg_str: 
+            self.chat_history_buffer.append(f"User: {msg_str}")
+            self.save_buffer_to_disk()
+
+        if img_url and not msg_str.startswith("/"):
+            if time.time() - getattr(self, "last_auto_save_time", 0) > self.local_config.get("auto_save_cooldown", 60):
+                asyncio.create_task(self.ai_evaluate_image(img_url, msg_str))
+
+        if msg_str.startswith(("/", "！", "!")):
+            if uid in self.debounce_tasks: self.debounce_tasks[uid].cancel(); await self._execute_buffer(uid, event)
+            return
+
+        debounce_time = self.local_config.get("debounce_time", 5.0)
+        event.stop_event()
+        
+        if debounce_time <= 0: 
+            await self._execute_buffer(uid, event)
+            return
+
+        if uid not in self.msg_buffers: self.msg_buffers[uid] = {'text': [], 'imgs': [], 'event': event}
+        self.msg_buffers[uid]['event'] = event 
+        if msg_str: self.msg_buffers[uid]['text'].append(msg_str)
+        if img_url: self.msg_buffers[uid]['imgs'].append(img_url)
+
+        # [日志] 打印防抖开始
+        print(f"🕒 [Meme] 收到消息，进入防抖倒计时: {debounce_time}秒 (UID: {uid})")
+
+        if uid in self.debounce_tasks: self.debounce_tasks[uid].cancel()
+        self.debounce_tasks[uid] = asyncio.create_task(self._debounce_waiter(uid, debounce_time))
+
+    async def _debounce_waiter(self, uid, duration):
+        try:
+            await asyncio.sleep(duration)
+            await self._execute_buffer(uid)
+        except asyncio.CancelledError: pass
+
+    async def _execute_buffer(self, uid, force_event=None):
+        if uid not in self.msg_buffers and not force_event: return
+        
+        # [日志] 打印防抖结束
+        print(f"🚀 [Meme] 防抖结束，开始构建 Prompt 发送请求 (UID: {uid})")
+
+        if uid in self.msg_buffers:
+            data = self.msg_buffers.pop(uid)
+            event = force_event or data['event']
+            texts = data['text']
+            imgs = data['imgs']
+        else:
+            event = force_event
+            texts = [(event.message_str or "").strip()]
+            imgs = []
+            img = self._get_img_url(event)
+            if img: imgs.append(img)
+        
+        # 触发记忆总结检查
+        asyncio.create_task(self.check_and_summarize())
+
+        time_info = self.get_time_str()
+        memory_info = f"\n[前情提要: {self.current_summary}]" if self.current_summary else ""
+        
+        hint_msg = ""
+        if random.randint(1, 100) <= self.local_config.get("reply_prob", 50):
+            all_tags = [v.get("tags", "").split(":")[0].strip() for v in self.data.values()]
+            if all_tags:
+                hints = random.sample(all_tags, min(15, len(all_tags)))
+                hint_str = " ".join([f"<MEME:{h}>" for h in hints])
+                hint_msg = f"\n[可用表情包: {hint_str}]\n回复格式: <MEME:名称>"
+
+        full_prompt = f"{time_info}{memory_info}\nUser: {' '.join(texts)}{hint_msg}"
+        
+        provider = self.context.get_using_provider()
+        if provider:
+            try:
+                resp = await provider.text_chat(prompt=full_prompt, session_id=event.session_id, image_urls=imgs)
+                reply = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
+                if reply: 
+                    # [收集对话] AI 回复成功，在这里存入缓冲区
+                    self.chat_history_buffer.append(f"AI: {reply}")
+                    self.save_buffer_to_disk()
+                    await self.process_and_send(event, reply)
+            except Exception as e: print(f"LLM请求失败: {e}")
+
+    async def check_and_summarize(self):
+        # 只有积攒了 50 条以上才总结
+        if len(self.chat_history_buffer) < 50: return
+        
+        # 复制一份当前的对话记录，准备发给 LLM
+        current_batch = list(self.chat_history_buffer)
+        history_text = "\n".join(current_batch)
+        
+        print(f"📖 [Meme] 缓存已满 {len(current_batch)} 条，开始触发记忆总结...")
+        provider = self.context.get_using_provider()
+        if not provider: return
+
+        now_str = self.get_time_str()
+        prompt = f"""当前时间：{now_str}
+这是最近的对话。请总结成一段“日记”，追加到长期记忆中。
+要求：包含准确时间信息，记录关键事件、用户偏好、重要梗。忽略无意义寒暄。200字以内。
+对话内容：
+{history_text}"""
+
+        try:
+            resp = await provider.text_chat(prompt=prompt, session_id=None)
+            summary = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
+            
+            if summary:
+                def write_task():
+                    with open(self.memory_file, "a", encoding="utf-8") as f: 
+                        f.write(f"\n\n--- {now_str} ---\n{summary}")
+                await asyncio.get_running_loop().run_in_executor(self.executor, write_task)
+                
+                self.current_summary = self.load_memory()
+                
+                # [关键逻辑] 只有总结成功了，才删除已经总结过的部分
+                self.chat_history_buffer = self.chat_history_buffer[len(current_batch):]
+                self.save_buffer_to_disk()
+                
+                # [日志] 打印总结成功
+                print(f"✅ [Meme] 记忆总结成功！已写入 memory.txt，并清理了 {len(current_batch)} 条缓存")
+        except Exception as e:
+            print(f"❌ [Meme] 总结失败 ({e})，暂不清理缓存")
+            # 兜底保护：如果积压太多(>100)，强制删除最早的50条，防止内存溢出
+            if len(self.chat_history_buffer) > 100:
+                print("⚠️ [Meme] 缓存积压过多，触发强制清理逻辑")
+                self.chat_history_buffer = self.chat_history_buffer[-50:]
+                self.save_buffer_to_disk()
 
     # ==========================
     # Web 服务
@@ -227,128 +382,9 @@ class MemeMaster(Star):
                     except Exception as e:
                         print(f"WARN: [Meme] 主动聊天失败: {e}")
 
-    @filter.event_message_type(EventMessageType.GROUP_MESSAGE, priority=50)
-    @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50) 
-    async def handle_msg(self, event: AstrMessageEvent):
-        try:
-            # 排除机器人自己
-            if str(event.message_obj.sender.user_id) == str(self.context.get_current_provider_bot().self_id): return
-        except: pass
-
-        msg_str = (event.message_str or "").strip()
-        img_url = self._get_img_url(event)
-        uid = event.unified_msg_origin
-
-        if not msg_str and not img_url: return
-
-        self.last_active_time = time.time()
-        self.last_session_id = event.session_id
-        self.last_uid = uid
-
-        if msg_str: 
-            self.chat_history_buffer.append(f"User: {msg_str}")
-            self.save_buffer_to_disk()
-
-        if img_url and not msg_str.startswith("/"):
-            if time.time() - getattr(self, "last_auto_save_time", 0) > self.local_config.get("auto_save_cooldown", 60):
-                asyncio.create_task(self.ai_evaluate_image(img_url, msg_str))
-
-        if msg_str.startswith(("/", "！", "!")):
-            if uid in self.debounce_tasks: self.debounce_tasks[uid].cancel(); await self._execute_buffer(uid, event)
-            return
-
-        debounce_time = self.local_config.get("debounce_time", 5.0)
-        if debounce_time <= 0: return
-
-        event.stop_event()
-
-        if uid not in self.msg_buffers: self.msg_buffers[uid] = {'text': [], 'imgs': [], 'event': event}
-        self.msg_buffers[uid]['event'] = event 
-        if msg_str: self.msg_buffers[uid]['text'].append(msg_str)
-        if img_url: self.msg_buffers[uid]['imgs'].append(img_url)
-
-        if uid in self.debounce_tasks: self.debounce_tasks[uid].cancel()
-        self.debounce_tasks[uid] = asyncio.create_task(self._debounce_waiter(uid, debounce_time))
-
-    async def _debounce_waiter(self, uid, duration):
-        try:
-            await asyncio.sleep(duration)
-            await self._execute_buffer(uid)
-        except asyncio.CancelledError: pass
-
-    async def _execute_buffer(self, uid, force_event=None):
-        if uid not in self.msg_buffers: return
-        data = self.msg_buffers.pop(uid)
-        event = force_event or data['event']
-        texts = data['text']
-        imgs = data['imgs']
-        
-        asyncio.create_task(self.check_and_summarize())
-
-        time_info = self.get_time_str()
-        memory_info = f"\n[前情提要: {self.current_summary}]" if self.current_summary else ""
-        
-        hint_msg = ""
-        if random.randint(1, 100) <= self.local_config.get("reply_prob", 50):
-            all_tags = [v.get("tags", "").split(":")[0].strip() for v in self.data.values()]
-            if all_tags:
-                hints = random.sample(all_tags, min(15, len(all_tags)))
-                hint_str = " ".join([f"<MEME:{h}>" for h in hints])
-                hint_msg = f"\n[可用表情包: {hint_str}]\n回复格式: <MEME:名称>"
-
-        full_prompt = f"{time_info}{memory_info}\nUser: {' '.join(texts)}{hint_msg}"
-        
-        provider = self.context.get_using_provider()
-        if provider:
-            try:
-                # 修复: 增加 prompt= 防止参数解析错误
-                resp = await provider.text_chat(prompt=full_prompt, session_id=event.session_id, image_urls=imgs)
-                reply = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-                if reply: 
-                    self.chat_history_buffer.append(f"AI: {reply}")
-                    self.save_buffer_to_disk()
-                    await self.process_and_send(event, reply)
-            except Exception as e: print(f"LLM请求失败: {e}")
-
-    async def check_and_summarize(self):
-        if len(self.chat_history_buffer) < 50: return
-        current_batch = list(self.chat_history_buffer)
-        history_text = "\n".join(current_batch)
-        
-        print(f"[Meme] 触发记忆总结...")
-        provider = self.context.get_using_provider()
-        if not provider: return
-
-        now_str = self.get_time_str()
-        prompt = f"""当前时间：{now_str}
-这是最近的对话。请总结成一段“日记”，追加到长期记忆中。
-要求：包含准确时间信息，记录关键事件、用户偏好、重要梗。忽略无意义寒暄。200字以内。
-对话内容：
-{history_text}"""
-
-        try:
-            resp = await provider.text_chat(prompt=prompt, session_id=None)
-            summary = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-            
-            if summary:
-                def write_task():
-                    with open(self.memory_file, "a", encoding="utf-8") as f: 
-                        f.write(f"\n\n--- {now_str} ---\n{summary}")
-                await asyncio.get_running_loop().run_in_executor(self.executor, write_task)
-                
-                self.current_summary = self.load_memory()
-                self.chat_history_buffer = self.chat_history_buffer[len(current_batch):]
-                self.save_buffer_to_disk()
-                print(f"[Meme] 记忆追加成功")
-        except Exception as e:
-            print(f"总结失败 ({e})")
-            if len(self.chat_history_buffer) > 100:
-                self.chat_history_buffer = self.chat_history_buffer[-50:]
-                self.save_buffer_to_disk()
-
     async def process_and_send(self, event, text, target_uid=None):
         text = text.replace("**", "").replace("### ", "")
-        print(f"[Meme] AI回复: {text[:30]}...")
+        print(f"📤 [Meme] AI回复: {text[:30]}...")
         try:
             pattern = r"(<MEME:.*?>|MEME_TAG:\s*[\S]+)"
             parts = re.split(pattern, text)
@@ -503,7 +539,6 @@ class MemeMaster(Star):
             if isinstance(c, Image): return c.url
         return None
 
-    # 以下辅助函数已展开，防止 SyntaxError
     def load_config(self):
         default_config = {
             "web_port": 5000,
