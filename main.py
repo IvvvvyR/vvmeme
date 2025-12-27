@@ -24,9 +24,9 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print("DEBUG: MemeMaster Pro (Final Apology Version) Loaded")
+print("DEBUG: MemeMaster Pro (Reborn Version) Loading...")
 
-@register("vv_meme_master", "Vvivloy", "多功能", "4.3.0")
+@register("vv_meme_master", "Vvivloy", "防抖/图库/记忆/自动进货", "5.0.0")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -66,13 +66,15 @@ class MemeMaster(Star):
             loop.create_task(self.start_web_server())
             loop.create_task(self._init_image_hashes())
             loop.create_task(self._lonely_watcher()) # 主动聊天任务
+            print("✅ [Meme] 核心服务启动成功，事件监听器已就绪")
         except Exception as e:
             print(f"ERROR: 任务启动失败: {e}")
 
     def __del__(self):
         self.running = False 
-# ===============================================================
-    # 核心 1：输入处理 (移植自“完全能用版”的超稳防抖逻辑)
+
+    # ===============================================================
+    # 核心 1：输入处理 (防抖 + 自动进货 + 记忆注入)
     # ===============================================================
     async def _debounce_timer(self, uid: str, duration: float):
         try:
@@ -95,7 +97,7 @@ class MemeMaster(Star):
             uid = event.unified_msg_origin
             img_urls = self._get_all_img_urls(event)
 
-            # 打印日志证明活著
+            # 打印日志证明活着
             print(f"📨 [Meme] 收到: {msg_str[:10]}... (图:{len(img_urls)})", flush=True)
 
             # 更新活跃时间（给主动聊天用）
@@ -105,7 +107,6 @@ class MemeMaster(Star):
 
             # 2. 暗线任务：自动进货 (不影响防抖，后台跑)
             if img_urls and not msg_str.startswith("/"):
-                # 安全获取配置
                 try: cd = float(self.local_config.get("auto_save_cooldown", 60))
                 except: cd = 60
                 
@@ -129,7 +130,6 @@ class MemeMaster(Star):
             except: debounce_time = 3.0
 
             if debounce_time <= 0:
-                # 如果防抖关闭，直接跳到最后去处理上下文注入
                 pass 
             else:
                 # --- 情况 A: 已经有会话在等了 (追加模式) ---
@@ -143,7 +143,7 @@ class MemeMaster(Star):
                     if s.get('timer_task'): s['timer_task'].cancel()
                     s['timer_task'] = asyncio.create_task(self._debounce_timer(uid, debounce_time))
                     
-                    # 【关键】杀掉当前事件，不让 AstrBot 处理它，因为它已经被存起来了
+                    # 【关键】杀掉当前事件
                     event.stop_event()
                     print(f"🔄 [Meme] 追加消息 (当前队列: {len(s['queue'])})", flush=True)
                     return 
@@ -188,7 +188,7 @@ class MemeMaster(Star):
                 msg_str = " ".join(combined_text_list)
                 img_urls = combined_images
 
-            # 5. 上下文与记忆注入 (New Features)
+            # 5. 上下文与记忆注入
             self.msg_count += 1
             
             # 记录到 buffer
@@ -223,7 +223,6 @@ class MemeMaster(Star):
             for url in img_urls:
                 chain.append(Image.fromURL(url))
             
-            # 修改事件对象，放行给 LLM
             event.message_str = final_text
             event.message_obj.message = chain
             
@@ -317,7 +316,7 @@ class MemeMaster(Star):
 
         except Exception as e:
             print(f"❌ [Meme] 输出处理出错: {e}")
-    # 
+
     # ===============================================================
     # 功能逻辑：自动鉴图 (指纹检测 + 上下文感知)
     # ===============================================================
@@ -344,13 +343,10 @@ class MemeMaster(Star):
             default_prompt = "判断这张图是否适合做表情包。适合回YES并给出<名称>:说明，不适合回NO。"
             raw_prompt = self.local_config.get("ai_prompt", default_prompt)
             
-            # 如果 Prompt 里写了 {context_text}，就替换掉；否则直接用
             if "{context_text}" in raw_prompt:
                 prompt = raw_prompt.replace("{context_text}", context_text)
             else:
                 prompt = raw_prompt
-            
-            # print(f"🔍 [Meme] 发送鉴图请求，配文: {context_text}")
             
             resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
             content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
@@ -370,7 +366,7 @@ class MemeMaster(Star):
                     self.save_data()
         except Exception as e:
             print(f"❌ [自动进货] 出错: {e}")
-            
+
     # ===============================================================
     # 功能逻辑：主动聊天
     # ===============================================================
@@ -430,7 +426,7 @@ class MemeMaster(Star):
             if not provider: return
             
             history_text = "\n".join(batch)
-            now_str = self.get_full_time_str() # 使用带阴历的时间
+            now_str = self.get_full_time_str() 
             
             prompt = f"""当前时间：{now_str}
                 这是一段过去的对话记录。请将其总结为一段简练的“长期记忆”或“日记”。
@@ -449,42 +445,24 @@ class MemeMaster(Star):
                 await asyncio.get_running_loop().run_in_executor(self.executor, write)
                 
                 self.current_summary = self.load_memory()
-                
-                # 清理 Buffer
                 self.chat_history_buffer = self.chat_history_buffer[len(batch):]
                 self.save_buffer_to_disk()
-                
-                print(f"✅ [Meme] 总结完成！Buffer库已删除 ({len(batch)}条记录)，长期记忆已更新。")
+                print(f"✅ [Meme] 总结完成！")
         except Exception as e:
             print(f"❌ [Meme] 总结失败: {e}")
-            if len(self.chat_history_buffer) > 100:
-                self.chat_history_buffer = self.chat_history_buffer[-50:]
-                self.save_buffer_to_disk()
         finally:
             self.is_summarizing = False
 
     async def _init_image_hashes(self):
-        # [修改] 放到函数最开头打印，确保你一眼能看到
-        if not os.path.exists(self.img_dir): 
-            print("⚠️ [Meme] 图片目录不存在，跳过指纹构建")
-            return
-
-        total_files = len([n for n in os.listdir(self.img_dir) if n.lower().endswith(('.jpg', '.png', '.jpeg', '.gif', '.webp'))])
-        print(f"🔄 [Meme] 正在加载图库索引，当前共有 {total_files} 张图片...")
-
+        if not os.path.exists(self.img_dir): return
         loop = asyncio.get_running_loop()
         count = 0
-        
         for f in os.listdir(self.img_dir):
             if not f.lower().endswith(('.jpg', '.png', '.jpeg', '.gif', '.webp')): continue
-            
-            # 优先读缓存
             if f in self.data and 'hash' in self.data[f] and self.data[f]['hash']:
                 self.img_hashes[f] = self.data[f]['hash']
                 count += 1
                 continue
-            
-            # 无缓存则计算
             try:
                 path = os.path.join(self.img_dir, f)
                 with open(path, "rb") as fl: content = fl.read()
@@ -495,9 +473,8 @@ class MemeMaster(Star):
                     self.data[f]['hash'] = h
                     count += 1
             except: pass
-            
         self.save_data()
-        print(f"✅ [Meme] 图库索引加载完毕！有效指纹: {count}/{total_files}")
+        print(f"✅ [Meme] 图库索引加载完毕！有效指纹: {count}")
 
     async def _calc_hash_async(self, image_data):
         def _sync():
@@ -588,14 +565,10 @@ class MemeMaster(Star):
         except: return ""
     def read_file(self, n): return open(os.path.join(self.base_dir, n), "r", encoding="utf-8").read()
     def check_auth(self, r): return r.query.get("token") == self.local_config.get("web_token")
-    # ==========================
-    # [新增] 辅助工具：获取详细时间 + 去除Markdown
-    # ==========================
+
     def get_full_time_str(self):
         now = datetime.datetime.now()
-        # 基础阳历 + 时间
         time_str = now.strftime('%Y-%m-%d %H:%M')
-        # 尝试获取阴历
         if HAS_LUNAR:
             try:
                 lunar = Solar.fromYmdHms(now.year, now.month, now.day, now.hour, now.minute, now.second).getLunar()
@@ -604,11 +577,8 @@ class MemeMaster(Star):
         return time_str
 
     def clean_markdown(self, text):
-        # 去除 **粗体**
         text = text.replace("**", "")
-        # 去除 ### 标题
         text = text.replace("### ", "").replace("## ", "")
-        # 去除 > 引用
         if text.startswith("> "): text = text[2:]
         return text.strip()
 
@@ -618,7 +588,6 @@ class MemeMaster(Star):
     async def start_web_server(self):
         app = web.Application()
         app._client_max_size = 100 * 1024 * 1024 
-        
         app.router.add_get("/", self.h_idx)
         app.router.add_post("/upload", self.h_up)
         app.router.add_post("/batch_delete", self.h_del)
@@ -627,12 +596,8 @@ class MemeMaster(Star):
         app.router.add_post("/update_config", self.h_ucf)
         app.router.add_get("/backup", self.h_backup)
         app.router.add_post("/restore", self.h_restore)
-        
-        # [补回] 这一行之前漏了！导致404
         app.router.add_post("/slim_images", self.h_slim)
-        
         app.router.add_static("/images/", path=self.img_dir)
-        
         runner = web.AppRunner(app)
         await runner.setup()
         port = self.local_config.get("web_port", 5000)
@@ -674,91 +639,54 @@ class MemeMaster(Star):
     async def h_ucf(self,r):
         if not self.check_auth(r): return web.Response(status=403)
         self.local_config.update(await r.json()); self.save_config(); return web.Response(text="ok")
+    
+    # 修复版备份
     async def h_backup(self,r):
         if not self.check_auth(r): return web.Response(status=403)
         b=io.BytesIO()
         with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
-            # 1. 备份图片
             for root,_,files in os.walk(self.img_dir): 
                 for f in files: z.write(os.path.join(root,f),f"images/{f}")
-            
-            # 2. 备份配置文件和索引
             if os.path.exists(self.data_file): z.write(self.data_file,"memes.json")
             if os.path.exists(self.config_file): z.write(self.config_file,"config.json")
-            
-            # 3. [补回] 备份长期记忆
             if os.path.exists(self.memory_file): z.write(self.memory_file, "memory.txt")
-            
-            # 4. [可选] 备份当前的对话缓存(Buffer)，防止重启后丢失刚才聊的内容
             if os.path.exists(self.buffer_file): z.write(self.buffer_file, "buffer.json")
-
         b.seek(0)
         return web.Response(body=b, headers={'Content-Disposition':'attachment; filename="meme_backup.zip"'})
-    # ==========================
-    # 修复版：备份恢复函数
-    # ==========================
+    
+    # 修复版恢复
     async def h_restore(self, r):
-        # 1. 鉴权
-        if not self.check_auth(r): 
-            return web.Response(status=403, text="Forbidden")
-        
+        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
         try:
-            # 2. 读取文件
             reader = await r.multipart()
             field = await reader.next()
-            if not field or field.name != 'file': 
-                return web.Response(status=400, text="Invalid file field")
-            
+            if not field or field.name != 'file': return web.Response(status=400, text="Invalid file")
             file_data = await field.read()
-            if not file_data:
-                return web.Response(status=400, text="Empty file")
-
-            print(f"📦 [Meme] 收到备份包，大小: {len(file_data)} bytes")
-
-            # 3. 解压动作
+            if not file_data: return web.Response(status=400, text="Empty file")
             def unzip_action():
-                with zipfile.ZipFile(io.BytesIO(file_data), 'r') as z:
-                    z.extractall(self.base_dir)
-
+                with zipfile.ZipFile(io.BytesIO(file_data), 'r') as z: z.extractall(self.base_dir)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self.executor, unzip_action)
-
-            # 4. [关键] 重新加载所有数据到内存
             self.data = self.load_data()
             self.local_config = self.load_config()
-            self.current_summary = self.load_memory() # <--- 这一步让记忆立即生效
-            self.chat_history_buffer = self.load_buffer_from_disk() # <--- 恢复聊天进度
-
-            # 重新构建图片索引
+            self.current_summary = self.load_memory() 
+            self.chat_history_buffer = self.load_buffer_from_disk()
             asyncio.create_task(self._init_image_hashes())
-
-            print("✅ [Meme] 备份恢复成功！记忆已刷新。")
             return web.Response(text="ok")
-
         except Exception as e:
-            print(f"❌ [Meme] 恢复失败: {e}")
             return web.Response(status=500, text=f"Error: {str(e)}")
-    # ==========================
-    # [补回] 图片瘦身处理函数
-    # ==========================
+
     async def h_slim(self, r):
         if not self.check_auth(r): return web.Response(status=403)
         loop = asyncio.get_running_loop()
         count = 0
-        total_files = len(os.listdir(self.img_dir))
-        print(f"⚡ [Meme] 正在执行图片瘦身，总计 {total_files} 张...")
-        
         for f in os.listdir(self.img_dir):
             try:
                 p = os.path.join(self.img_dir, f)
                 with open(p, 'rb') as fl: raw = fl.read()
-                # 重新压缩
                 nd, _ = await self._compress_image(raw)
-                # 如果压缩后更小，就覆盖
                 if len(nd) < len(raw):
                     with open(p, 'wb') as fl: fl.write(nd)
                     count += 1
             except: pass
-            
-        print(f"✅ [Meme] 瘦身完成，优化了 {count} 张图片")
         return web.Response(text=f"优化了 {count} 张")
