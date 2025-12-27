@@ -480,13 +480,27 @@ class MemeMaster(Star):
             self.is_summarizing = False
 
     async def _init_image_hashes(self):
+        # [修改] 放到函数最开头打印，确保你一眼能看到
+        if not os.path.exists(self.img_dir): 
+            print("⚠️ [Meme] 图片目录不存在，跳过指纹构建")
+            return
+
+        total_files = len([n for n in os.listdir(self.img_dir) if n.lower().endswith(('.jpg', '.png', '.jpeg', '.gif', '.webp'))])
+        print(f"🔄 [Meme] 正在加载图库索引，当前共有 {total_files} 张图片...")
+
         loop = asyncio.get_running_loop()
-        if not os.path.exists(self.img_dir): return
+        count = 0
+        
         for f in os.listdir(self.img_dir):
             if not f.lower().endswith(('.jpg', '.png', '.jpeg', '.gif', '.webp')): continue
+            
+            # 优先读缓存
             if f in self.data and 'hash' in self.data[f] and self.data[f]['hash']:
                 self.img_hashes[f] = self.data[f]['hash']
+                count += 1
                 continue
+            
+            # 无缓存则计算
             try:
                 path = os.path.join(self.img_dir, f)
                 with open(path, "rb") as fl: content = fl.read()
@@ -495,8 +509,11 @@ class MemeMaster(Star):
                     self.img_hashes[f] = h
                     if f not in self.data: self.data[f] = {"tags": "未分类", "source": "unknown"}
                     self.data[f]['hash'] = h
+                    count += 1
             except: pass
+            
         self.save_data()
+        print(f"✅ [Meme] 图库索引加载完毕！有效指纹: {count}/{total_files}")
 
     async def _calc_hash_async(self, image_data):
         def _sync():
@@ -614,17 +631,29 @@ class MemeMaster(Star):
     # Web Server
     # ==========================
     async def start_web_server(self):
-        app = web.Application(); app._client_max_size = 100*1024*1024 
-        app.router.add_get("/", self.h_idx); app.router.add_post("/upload", self.h_up)
-        app.router.add_post("/batch_delete", self.h_del); app.router.add_post("/update_tag", self.h_tag)
-        app.router.add_get("/get_config", self.h_gcf); app.router.add_post("/update_config", self.h_ucf)
-        app.router.add_get("/backup", self.h_backup); app.router.add_post("/restore", self.h_restore)
+        app = web.Application()
+        app._client_max_size = 100 * 1024 * 1024 
+        
+        app.router.add_get("/", self.h_idx)
+        app.router.add_post("/upload", self.h_up)
+        app.router.add_post("/batch_delete", self.h_del)
+        app.router.add_post("/update_tag", self.h_tag)
+        app.router.add_get("/get_config", self.h_gcf)
+        app.router.add_post("/update_config", self.h_ucf)
+        app.router.add_get("/backup", self.h_backup)
+        app.router.add_post("/restore", self.h_restore)
+        
+        # [补回] 这一行之前漏了！导致404
+        app.router.add_post("/slim_images", self.h_slim)
+        
         app.router.add_static("/images/", path=self.img_dir)
-        runner = web.AppRunner(app); await runner.setup()
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
         port = self.local_config.get("web_port", 5000)
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        print(f"DEBUG: [Meme] WebUI started at port {port}")
+        print(f"🌐 [Meme] WebUI 管理后台已启动: http://localhost:{port}")
 
     async def h_idx(self,r): 
         if not self.check_auth(r): return web.Response(status=403, text="Need ?token=xxx")
@@ -673,6 +702,30 @@ class MemeMaster(Star):
         rd = await r.multipart(); f = await rd.next()
         if f.name != 'file': return web.Response(status=400)
         dat = await f.read()
+    # ==========================
+    # [补回] 图片瘦身处理函数
+    # ==========================
+    async def h_slim(self, r):
+        if not self.check_auth(r): return web.Response(status=403)
+        loop = asyncio.get_running_loop()
+        count = 0
+        total_files = len(os.listdir(self.img_dir))
+        print(f"⚡ [Meme] 正在执行图片瘦身，总计 {total_files} 张...")
+        
+        for f in os.listdir(self.img_dir):
+            try:
+                p = os.path.join(self.img_dir, f)
+                with open(p, 'rb') as fl: raw = fl.read()
+                # 重新压缩
+                nd, _ = await self._compress_image(raw)
+                # 如果压缩后更小，就覆盖
+                if len(nd) < len(raw):
+                    with open(p, 'wb') as fl: fl.write(nd)
+                    count += 1
+            except: pass
+            
+        print(f"✅ [Meme] 瘦身完成，优化了 {count} 张图片")
+        return web.Response(text=f"优化了 {count} 张")
         def unzip(): 
             with zipfile.ZipFile(io.BytesIO(dat),'r') as z: z.extractall(self.base_dir)
         await asyncio.get_running_loop().run_in_executor(self.executor, unzip)
