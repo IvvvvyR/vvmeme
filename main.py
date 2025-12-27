@@ -72,9 +72,8 @@ class MemeMaster(Star):
     def __del__(self):
         self.running = False 
 
-    
-    # ===============================================================
-    # 核心 1：输入处理 (防抖 + 多图 + 注入) - 修复版
+# ===============================================================
+    # 核心 1：输入处理 (防抖 + 多图 + 注入) - 修复增强版
     # ===============================================================
     async def _debounce_timer(self, uid: str, duration: float):
         try:
@@ -87,129 +86,166 @@ class MemeMaster(Star):
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50)
     @filter.event_message_type(EventMessageType.GROUP_MESSAGE, priority=50)
     async def handle_input(self, event: AstrMessageEvent):
-        # 跳过自己的消息
+        # 0. 全局异常捕获，防止函数静默崩溃
         try:
-            if str(event.message_obj.sender.user_id) == str(self.context.get_current_provider_bot().self_id): 
+            # 跳过自己的消息
+            try:
+                if str(event.message_obj.sender.user_id) == str(self.context.get_current_provider_bot().self_id): 
+                    return
+            except: 
+                pass
+
+            msg_str = (event.message_str or "").strip()
+            # 这里的获取可能会出错，加上容错
+            try:
+                uid = event.unified_msg_origin
+            except Exception as e:
+                print(f"⚠️ [Meme] 获取UID失败: {e}")
                 return
-        except: 
-            pass
 
-        msg_str = (event.message_str or "").strip()
-        img_urls = self._get_all_img_urls(event)
-        uid = event.unified_msg_origin
+            img_urls = self._get_all_img_urls(event)
 
-        print(f"📨 [Meme] 收到消息 uid={uid}, 文本长度={len(msg_str)}, 图片数={len(img_urls)}")
+            # [修复] 必须确保 print 显示出来
+            print(f"📨 [Meme] 收到消息 uid={uid}, 文本长度={len(msg_str)}, 图片数={len(img_urls)}", flush=True)
 
-        # [关键] 更新活跃状态，供主动聊天使用
-        self.last_active_time = time.time()
-        self.last_session_id = event.session_id
-        self.last_uid = uid
+            # [关键] 更新活跃状态
+            self.last_active_time = time.time()
+            self.last_session_id = event.session_id
+            self.last_uid = uid
 
-        # 1. 自动进货 (指纹去重 + 批量)
-        if img_urls and not msg_str.startswith("/"):
-            cooldown = self.local_config.get("auto_save_cooldown", 60)
-            if time.time() - getattr(self, "last_auto_save_time", 0) > cooldown:
-                self.last_auto_save_time = time.time()
-                print(f"🕵️ [Meme] 触发自动鉴图，后台处理 {len(img_urls)} 张图...")
-                for url in img_urls:
-                    asyncio.create_task(self.ai_evaluate_image(url))
+            # 1. 自动进货
+            if img_urls and not msg_str.startswith("/"):
+                # [修复] 这里的 cooldown 读取也做一下类型转换防止报错
+                try:
+                    cooldown = float(self.local_config.get("auto_save_cooldown", 60))
+                except:
+                    cooldown = 60
+                
+                if time.time() - getattr(self, "last_auto_save_time", 0) > cooldown:
+                    self.last_auto_save_time = time.time()
+                    print(f"🕵️ [Meme] 触发自动鉴图，后台处理 {len(img_urls)} 张图...", flush=True)
+                    for url in img_urls:
+                        asyncio.create_task(self.ai_evaluate_image(url))
 
-        # 2. 指令穿透
-        if msg_str.startswith(("/", "！", "!")):
-            print(f"⚡ [Meme] 检测到指令消息，直接穿透")
-            if uid in self.sessions:
-                if self.sessions[uid].get('timer_task'): 
-                    self.sessions[uid]['timer_task'].cancel()
-                self.sessions[uid]['flush_event'].set()
-            return
+            # 2. 指令穿透
+            if msg_str.startswith(("/", "！", "!")):
+                print(f"⚡ [Meme] 检测到指令消息，直接穿透", flush=True)
+                if uid in self.sessions:
+                    if self.sessions[uid].get('timer_task'): 
+                        self.sessions[uid]['timer_task'].cancel()
+                    self.sessions[uid]['flush_event'].set()
+                return
 
-        # 3. 防抖逻辑
-        debounce_time = self.local_config.get("debounce_time", 3.0)
-        if debounce_time <= 0: 
-            print(f"⏭️ [Meme] 防抖已禁用，直接放行")
-            return 
+            # 3. 防抖逻辑
+            # [修复核心BUG] 强制转换为 float，防止 WebUI 传入字符串导致 "type error" 崩溃
+            try:
+                debounce_time = float(self.local_config.get("debounce_time", 3.0))
+            except Exception as e:
+                print(f"⚠️ [Meme] 防抖时间配置错误，重置为3秒: {e}")
+                debounce_time = 3.0
 
-        # 如果已经有session，追加内容并重置计时器
-        if uid in self.sessions:
-            s = self.sessions[uid]
-            if msg_str: s['buffer'].append(msg_str)
-            if img_urls: s['images'].extend(img_urls)
-            if s.get('timer_task'): 
-                s['timer_task'].cancel()
-            s['timer_task'] = asyncio.create_task(self._debounce_timer(uid, debounce_time))
-            event.stop_event()
-            print(f"🔄 [Meme] 消息追加到现有session，重置防抖计时器 (当前buffer: {len(s['buffer'])}条)")
-            return
+            if debounce_time <= 0: 
+                print(f"⏭️ [Meme] 防抖已禁用，直接放行", flush=True)
+                # 注意：这里没有return，而是继续往下走，否则就没有上下文注入了
+                # 如果禁用了防抖，我们直接跳过 wait 逻辑，直接去处理 Context
+            else:
+                # 如果已经有session，追加内容并重置计时器
+                if uid in self.sessions:
+                    s = self.sessions[uid]
+                    if msg_str: s['buffer'].append(msg_str)
+                    if img_urls: s['images'].extend(img_urls)
+                    if s.get('timer_task'): 
+                        s['timer_task'].cancel()
+                    s['timer_task'] = asyncio.create_task(self._debounce_timer(uid, debounce_time))
+                    event.stop_event() # 停止当前事件传播，等待合并
+                    print(f"🔄 [Meme] 消息追加到现有session，重置计时器 (当前buffer: {len(s['buffer'])}条)", flush=True)
+                    return
 
-        # 创建新session
-        print(f"🆕 [Meme] 创建新防抖session，等待 {debounce_time}秒...")
-        flush_event = asyncio.Event()
-        timer_task = asyncio.create_task(self._debounce_timer(uid, debounce_time))
-        self.sessions[uid] = {
-            'buffer': [msg_str] if msg_str else [],
-            'images': img_urls if img_urls else [],
-            'flush_event': flush_event,
-            'timer_task': timer_task
-        }
-        
-        # 等待防抖结束
-        await flush_event.wait()
-        print(f"⏰ [Meme] 防抖倒计时结束，准备处理消息")
+                # 创建新session
+                print(f"🆕 [Meme] 创建新防抖session，等待 {debounce_time}秒...", flush=True)
+                flush_event = asyncio.Event()
+                timer_task = asyncio.create_task(self._debounce_timer(uid, debounce_time))
+                self.sessions[uid] = {
+                    'buffer': [msg_str] if msg_str else [],
+                    'images': img_urls if img_urls else [],
+                    'flush_event': flush_event,
+                    'timer_task': timer_task
+                }
+                
+                # 等待防抖结束 (这里会挂起，直到计时器触发 set())
+                await flush_event.wait()
+                print(f"⏰ [Meme] 防抖倒计时结束，准备处理消息", flush=True)
 
-        if uid not in self.sessions: 
-            print(f"⚠️ [Meme] Session已被清理，跳过处理")
-            return
+                if uid not in self.sessions: 
+                    print(f"⚠️ [Meme] Session已被清理，跳过处理", flush=True)
+                    return
+                    
+                s = self.sessions.pop(uid)
+                msg_str = " ".join(s['buffer']).strip() # 更新 msg_str 为合并后的文本
+                img_urls = s['images'] # 更新图片列表
+                
+                if not msg_str and not img_urls: 
+                    print(f"🚫 [Meme] 合并后内容为空，跳过", flush=True)
+                    return
+
+                print(f"✅ [Meme] 防抖完成，合并了 {len(s['buffer'])}条文本 + {len(img_urls)}张图", flush=True)
+
+            # 4. 记录 Buffer
+            img_mark = f" [Image*{len(img_urls)}]" if img_urls else ""
+            self.chat_history_buffer.append(f"User: {msg_str}{img_mark}")
+            self.save_buffer_to_disk()
+
+            # 5. 上下文注入
+            self.msg_count += 1
+            # [修复] 同样做类型转换
+            try:
+                inject_interval = int(self.local_config.get("memory_interval", 20))
+                summary_threshold = int(self.local_config.get("summary_threshold", 40))
+            except:
+                inject_interval = 20
+                summary_threshold = 40
+
+            should_inject_memory = (self.msg_count % inject_interval == 0) or (self.msg_count == 1)
             
-        s = self.sessions.pop(uid)
-        merged_text = " ".join(s['buffer']).strip()
-        
-        if not merged_text and not s['images']: 
-            print(f"🚫 [Meme] 合并后内容为空，跳过")
-            return
+            # 打印信息库条数累积 (你找不到的那个日志就在这里)
+            print(f"📊 [Meme] 信息库: {len(self.chat_history_buffer)}/{summary_threshold}条 (本轮#{self.msg_count})", flush=True)
 
-        print(f"✅ [Meme] 防抖完成，合并了 {len(s['buffer'])}条文本 + {len(s['images'])}张图")
-
-        # 4. 记录 Buffer
-        img_mark = f" [Image*{len(s['images'])}]" if s['images'] else ""
-        self.chat_history_buffer.append(f"User: {merged_text}{img_mark}")
-        self.save_buffer_to_disk()
-
-        # 5. 上下文注入
-        self.msg_count += 1
-        inject_interval = self.local_config.get("memory_interval", 20)
-        summary_threshold = self.local_config.get("summary_threshold", 40)
-        should_inject_memory = (self.msg_count % inject_interval == 0) or (self.msg_count == 1)
-        
-        # 打印信息库条数累积
-        print(f"📊 [Meme] 信息库: {len(self.chat_history_buffer)}/{summary_threshold}条 (本轮#{self.msg_count})")
-
-        time_info = self.get_full_time_str()
-        system_note_parts = [f"Time: {time_info}"]
-        
-        if should_inject_memory and self.current_summary:
-            print(f"🧠 [Meme] 注入长期记忆 (长度: {len(self.current_summary)} chars)")
-            system_note_parts.append(f"Long-term Memory: {self.current_summary}")
-        
-        # 随机表情包提示
-        if random.randint(1, 100) <= self.local_config.get("reply_prob", 50):
-            all_tags = [v.get("tags", "").split(":")[0].strip() for v in self.data.values()]
-            if all_tags:
-                hints = random.sample(all_tags, min(15, len(all_tags)))
-                hint_str = " ".join([f"<MEME:{h}>" for h in hints])
-                system_note_parts.append(f"Meme Hints: {hint_str}")
-                print(f"🎲 [Meme] 本次提供 {len(hints)} 个表情包提示")
-        
-        system_note_str = " | ".join(system_note_parts)
-        final_text = f"{merged_text}\n\n(System Context: {system_note_str})"
-        
-        # 6. 重新组装消息链并放行
-        chain = [Plain(final_text)]
-        for url in s['images']:
-            chain.append(Image.fromURL(url))
+            time_info = self.get_full_time_str()
+            system_note_parts = [f"Time: {time_info}"]
             
-        event.message_str = final_text
-        event.message_obj.message = chain
-        print(f"🚀 [Meme] 消息处理完成，放行！")
+            if should_inject_memory and self.current_summary:
+                print(f"🧠 [Meme] 注入长期记忆 (长度: {len(self.current_summary)} chars)", flush=True)
+                system_note_parts.append(f"Long-term Memory: {self.current_summary}")
+            
+            # 随机表情包提示
+            try:
+                reply_prob = int(self.local_config.get("reply_prob", 50))
+            except: reply_prob = 50
+
+            if random.randint(1, 100) <= reply_prob:
+                all_tags = [v.get("tags", "").split(":")[0].strip() for v in self.data.values()]
+                if all_tags:
+                    hints = random.sample(all_tags, min(15, len(all_tags)))
+                    hint_str = " ".join([f"<MEME:{h}>" for h in hints])
+                    system_note_parts.append(f"Meme Hints: {hint_str}")
+                    print(f"🎲 [Meme] 本次提供 {len(hints)} 个表情包提示", flush=True)
+            
+            system_note_str = " | ".join(system_note_parts)
+            final_text = f"{msg_str}\n\n(System Context: {system_note_str})"
+            
+            # 6. 重新组装消息链并放行
+            chain = [Plain(final_text)]
+            for url in img_urls:
+                chain.append(Image.fromURL(url))
+                
+            event.message_str = final_text
+            event.message_obj.message = chain
+            print(f"🚀 [Meme] 消息处理完成，放行！", flush=True)
+
+        except Exception as e:
+            import traceback
+            print(f"❌ [Meme] 输入处理发生严重错误: {e}")
+            traceback.print_exc()
 
     # ===============================================================
     # 核心 2：输出处理 (分段 + 表情包)
