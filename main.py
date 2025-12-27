@@ -154,7 +154,7 @@ class MemeMaster(Star):
         
         if should_inject_memory and self.current_summary:
             print(f"🧠 [Meme] 注入长期记忆...")
-@filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50)
+    @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=50)
     @filter.event_message_type(EventMessageType.GROUP_MESSAGE, priority=50)
     async def handle_input(self, event: AstrMessageEvent):
         try:
