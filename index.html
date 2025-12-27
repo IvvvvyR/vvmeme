@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>MemeMaster Pro V14</title>
+    <title>MemeMaster Pro Ultimate</title>
     <style>
         :root { 
             --primary: #6366f1; 
@@ -246,6 +246,22 @@
                         <div class="hint">每积攒多少条对话写一次日记</div>
                     </div>
                 </div>
+
+                <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
+                <div class="form-group">
+                    <label>主动聊天间隔 (分钟, 0为关闭)</label>
+                    <input type="number" id="conf_proactive_interval">
+                </div>
+                <div style="display:flex; gap:10px;">
+                    <div class="form-group">
+                        <label>静默开始 (小时)</label>
+                        <input type="number" id="conf_quiet_start" placeholder="23">
+                    </div>
+                    <div class="form-group">
+                        <label>静默结束 (小时)</label>
+                        <input type="number" id="conf_quiet_end" placeholder="7">
+                    </div>
+                </div>
             </div>
             <div style="display:flex; justify-content:space-between; margin-top:25px;">
                 <button class="btn-ghost" onclick="closeSettings()">取消</button>
@@ -256,7 +272,7 @@
 
     <script>
         const rawData = {{MEME_DATA}}; 
-        const token = "admin123"; // 由Python替换
+        const token = "admin123"; 
         let state = { filter: 'all', search: '', page: 1, pageSize: 20, selMode: false, selected: new Set(), items: [], editingFile: null };
         let longPressTimer;
 
@@ -357,7 +373,9 @@
         async function openSettings() {
             try {
                 const c = await (await fetch(`/get_config?token=${token}`)).json();
-                ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 'memory_interval', 'summary_threshold'].forEach(k => {
+                ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
+                 'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end']
+                .forEach(k => {
                     if(document.getElementById(`conf_${k}`)) document.getElementById(`conf_${k}`).value = c[k]??0;
                 });
                 document.getElementById('conf_ai_prompt').value = c['ai_prompt'] || "";
@@ -367,7 +385,9 @@
         function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
         async function saveSettings() {
             const conf = {};
-            ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 'memory_interval', 'summary_threshold'].forEach(k => {
+            ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
+             'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end']
+            .forEach(k => {
                 conf[k] = parseFloat(document.getElementById(`conf_${k}`).value);
             });
             conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
