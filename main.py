@@ -125,7 +125,7 @@ class MemeMaster(Star):
                     self.last_auto_save_time = time.time()
                     print(f"🕵️ [Meme] 触发自动鉴图，后台处理 {len(img_urls)} 张图...", flush=True)
                     for url in img_urls:
-                        asyncio.create_task(self.ai_evaluate_image(url))
+                        asyncio.create_task(self.ai_evaluate_image(url, msg_str))
 
             # 2. 指令穿透
             if msg_str.startswith(("/", "！", "!")):
@@ -330,10 +330,11 @@ class MemeMaster(Star):
 
         except Exception as e:
             print(f"❌ [Meme] 输出处理出错: {e}")
+    # 
     # ===============================================================
-    # 功能逻辑：自动鉴图 (指纹检测)
+    # 功能逻辑：自动鉴图 (指纹检测 + 上下文感知)
     # ===============================================================
-    async def ai_evaluate_image(self, img_url):
+    async def ai_evaluate_image(self, img_url, context_text=""):
         try:
             img_data = None
             async with aiohttp.ClientSession() as s:
@@ -342,7 +343,6 @@ class MemeMaster(Star):
             if not img_data: return
 
             current_hash = await self._calc_hash_async(img_data)
-            # print(f"🔍 [Meme] 图片指纹计算完成: {current_hash}")
 
             if current_hash:
                 for _, exist_hash in self.img_hashes.items():
@@ -353,8 +353,17 @@ class MemeMaster(Star):
             provider = self.context.get_using_provider()
             if not provider: return
             
-            default_prompt = "判断这张图是否适合做表情包(二次元/Meme)。适合回YES并给出<名称>:说明，不适合回NO。"
-            prompt = self.local_config.get("ai_prompt", default_prompt)
+            # [修改] 获取 Prompt 并注入上下文
+            default_prompt = "判断这张图是否适合做表情包。适合回YES并给出<名称>:说明，不适合回NO。"
+            raw_prompt = self.local_config.get("ai_prompt", default_prompt)
+            
+            # 如果 Prompt 里写了 {context_text}，就替换掉；否则直接用
+            if "{context_text}" in raw_prompt:
+                prompt = raw_prompt.replace("{context_text}", context_text)
+            else:
+                prompt = raw_prompt
+            
+            # print(f"🔍 [Meme] 发送鉴图请求，配文: {context_text}")
             
             resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
             content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
@@ -372,7 +381,8 @@ class MemeMaster(Star):
                     self.data[fn] = {"tags": full_tag, "source": "auto", "hash": current_hash}
                     if current_hash: self.img_hashes[fn] = current_hash
                     self.save_data()
-        except: pass
+        except Exception as e:
+            print(f"❌ [自动进货] 出错: {e}")
             
     # ===============================================================
     # 功能逻辑：主动聊天
