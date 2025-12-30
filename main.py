@@ -59,7 +59,7 @@ class MemeMaster(Star):
         self.last_active_time = time.time()
         
         self.pair_map = {'“': '”', '《': '》', '（': '）', '(': ')', '"': '"', "'": "'"}
-        self.split_chars = "\n。？！?!，,;；"
+        self.split_chars = "\n。？！?!"
 
         try:
             loop = asyncio.get_running_loop()
@@ -301,7 +301,7 @@ class MemeMaster(Star):
             print(f"❌ [Meme] 输出处理出错: {e}", flush=True)
 
     def clean_markdown(self, text):
-        text = re.sub(r"(?si)^[^\w\s]*thought.*?End of thought", "", text)
+        text = re.sub(r"(?si)[\s.]*thought.*?End of thought", "", text)
         text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL)
         text = text.replace("**", "")
         text = text.replace("### ", "").replace("## ", "")
