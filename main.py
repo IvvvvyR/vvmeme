@@ -499,15 +499,37 @@ class MemeMaster(Star):
                         text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
                         
                         if text:
-                            # ★★★ 3. 记得过滤 .thought ★★★
+                            # 1. 净化文本
                             text = self.clean_markdown(text)
-
                             self.chat_history_buffer.append(f"AI (Proactive): {text}")
                             self.save_buffer_to_disk()
                             
-                            # ★★★ 4. 加上分段发送逻辑 ★★★
-                            chain = [Plain(text)] 
-                            segments = self.smart_split(chain) # 切分！
+                            # ★★★ 2. 这里是新加的：解析表情包标签！ ★★★
+                            # 和 on_output 里一样的逻辑，把文字变成 Image 对象
+                            pattern = r"(<MEME:.*?>|MEME_TAG:\s*[\S]+)"
+                            parts = re.split(pattern, text)
+                            chain = []
+                            
+                            for part in parts:
+                                tag = None
+                                if part.startswith("<MEME:"): tag = part[6:-1].strip()
+                                elif "MEME_TAG:" in part: tag = part.replace("MEME_TAG:", "").strip()
+                                
+                                if tag:
+                                    path = self.find_best_match(tag)
+                                    if path: 
+                                        print(f"🎯 [Meme] 主动聊天命中: [{tag}]", flush=True)
+                                        chain.append(Image.fromFileSystem(path))
+                                elif part:
+                                    # 只有非空文字才加进去
+                                    if part.strip():
+                                        chain.append(Plain(part))
+                            
+                            # ★★★ 3. 解析完之后，再交给分段逻辑 ★★★
+                            # 如果没有内容（全是空字符），就不发了
+                            if not chain: continue
+
+                            segments = self.smart_split(chain)
                             
                             delay_base = self.local_config.get("delay_base", 0.5)
                             delay_factor = self.local_config.get("delay_factor", 0.1)
@@ -519,9 +541,7 @@ class MemeMaster(Star):
                                 mc = MessageChain()
                                 mc.chain = seg
                                 await self.context.send_message(uid, mc)
-                                # 模拟打字等待
-                                if i < len(segments) - 1: 
-                                    await asyncio.sleep(wait)
+                                if i < len(segments) - 1: await asyncio.sleep(wait)
 
                     except Exception as e:
                         print(f"❌ [Meme] 主动聊天出错: {e}", flush=True)
