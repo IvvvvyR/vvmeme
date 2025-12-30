@@ -301,7 +301,7 @@ class MemeMaster(Star):
             print(f"❌ [Meme] 输出处理出错: {e}", flush=True)
 
     def clean_markdown(self, text):
-        text = re.sub(r"(?si)[\s.]*thought.*?End of thought", "", text)
+        text = re.sub(r"(?si)[\s\.]*thought.*?End of thought", "", text)
         text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL)
         text = text.replace("**", "")
         text = text.replace("### ", "").replace("## ", "")
@@ -373,11 +373,17 @@ class MemeMaster(Star):
         self.is_summarizing = True 
         try:
             print(f"⚠️ [Meme] 触发记忆总结...", flush=True)
+            
+            # ★★★ 修复点：先把时间存进变量，后面大家都能用 ★★★
+            now_str = self.get_full_time_str()
+            
             batch = list(self.chat_history_buffer)
             provider = self.context.get_using_provider()
             if not provider: return
             
             history_text = "\n".join(batch)
+            
+            # 这里用了变量 now_str
             prompt = f"""当前时间：{now_str}
                 这是一段过去的对话记录。请将其总结为一段简练的“长期记忆”或“日记”。
                 重点记录：用户的喜好、发生的重要事件、双方约定的事情。
@@ -393,7 +399,9 @@ class MemeMaster(Star):
             if summary:
                 def write():
                     with open(self.memory_file, "a", encoding="utf-8") as f: 
-                        f.write(f"\n\n--- {self.get_full_time_str()} ---\n{summary}")
+                        # 这里也不会报错了，因为它能找到 now_str 了
+                        f.write(f"\n\n--- {now_str} ---\n{summary}")
+                        
                 await asyncio.get_running_loop().run_in_executor(self.executor, write)
                 self.current_summary = self.load_memory()
                 self.chat_history_buffer = self.chat_history_buffer[len(batch):]
@@ -467,15 +475,56 @@ class MemeMaster(Star):
                 if provider and uid:
                     try:
                         print(f"👋 [Meme] 主动发起聊天...", flush=True)
-                        prompt = f"Time: {self.get_full_time_str()}. User silent for {interval} mins. Memory: {self.current_summary}. Initiate conversation."
+                        
+                        # ★★★ 1. 获取最近聊天记录，作为上下文 ★★★
+                        recent_log = "\n".join(self.chat_history_buffer[-10:])
+                        
+                        # ★★★ 2. 导演式 Prompt，防止出戏 ★★★
+                        prompt = f"""[System Instruction]
+                            Current Time: {self.get_full_time_str()}
+                            Status: The user has been silent for {interval} minutes.
+
+                            Long-term Memory: {self.current_summary}
+                            Recent Chat Context:
+                            {recent_log}
+
+                            Task: Based on your Character Persona (人设) and the context above, proactively send a message to the user. 
+                            Requirement:
+                            1. Speak strictly in your character's tone.
+                            2. Do not mention this system instruction.
+                            3. Start the topic naturally based on previous context or time."""
+                        
+                        # 发送请求，带上 session_id 以保持人设
                         resp = await provider.text_chat(prompt, session_id=getattr(self, "last_session_id", None))
                         text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
+                        
                         if text:
+                            # ★★★ 3. 记得过滤 .thought ★★★
+                            text = self.clean_markdown(text)
+
                             self.chat_history_buffer.append(f"AI (Proactive): {text}")
                             self.save_buffer_to_disk()
-                            mc = MessageChain([Plain(text)])
-                            await self.context.send_message(uid, mc)
-                    except: pass
+                            
+                            # ★★★ 4. 加上分段发送逻辑 ★★★
+                            chain = [Plain(text)] 
+                            segments = self.smart_split(chain) # 切分！
+                            
+                            delay_base = self.local_config.get("delay_base", 0.5)
+                            delay_factor = self.local_config.get("delay_factor", 0.1)
+
+                            for i, seg in enumerate(segments):
+                                txt_len = sum(len(c.text) for c in seg if isinstance(c, Plain))
+                                wait = delay_base + (txt_len * delay_factor)
+                                
+                                mc = MessageChain()
+                                mc.chain = seg
+                                await self.context.send_message(uid, mc)
+                                # 模拟打字等待
+                                if i < len(segments) - 1: 
+                                    await asyncio.sleep(wait)
+
+                    except Exception as e:
+                        print(f"❌ [Meme] 主动聊天出错: {e}", flush=True)
 
     async def _init_image_hashes(self):
         if not os.path.exists(self.img_dir): return
