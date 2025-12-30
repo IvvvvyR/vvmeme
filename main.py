@@ -24,9 +24,9 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
-print(">>> [Meme] 插件主文件 v19 (Fix Crash) 已被系统加载 <<<", flush=True)
+print(">>> [Meme] 插件主文件 v20 (Fix msg_count) 已被系统加载 <<<", flush=True)
 
-@register("vv_meme_master", "Vvivloy", "防抖/图库/记忆/思考链/静默模式", "5.9.0")
+@register("vv_meme_master", "Vvivloy", "防抖/图库/记忆/思考链/静默模式", "6.0.0")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -52,6 +52,10 @@ class MemeMaster(Star):
         self.current_summary = self.load_memory()
         self.img_hashes = {} 
         self.sessions = {} 
+        
+        # ★★★ 补回了这个漏掉的变量！ ★★★
+        self.msg_count = 0 
+        
         self.is_summarizing = False
         self.last_auto_save_time = 0
         self.last_active_time = time.time()
@@ -77,7 +81,7 @@ class MemeMaster(Star):
         except asyncio.CancelledError: pass
 
     # ==========================
-    # 入口分流
+    # 入口分流 (保持 v18/19 的稳定结构)
     # ==========================
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=1)
     async def handle_private(self, event: AstrMessageEvent):
@@ -88,30 +92,21 @@ class MemeMaster(Star):
         await self._master_handler(event)
 
     # ==========================
-    # 主逻辑 (已修复崩溃点)
+    # 主逻辑
     # ==========================
     async def _master_handler(self, event: AstrMessageEvent):
-        print(f">>> [调试] 正在处理消息...", flush=True)
-
-        # 1. 基础防爆 & 机器人自检 (修复版)
+        # 1. 基础防爆 & 机器人自检
         try:
             user_id = str(event.message_obj.sender.user_id)
-            
-            # ★★★ 修复点：更安全的获取方式，且出错不退出 ★★★
-            # 尝试通过多种方式获取 Bot ID，获取不到就跳过检查，绝不报错退出
             bot_id = None
             if hasattr(self.context, 'get_current_provider_bot'):
                 bot = self.context.get_current_provider_bot()
                 if bot: bot_id = str(bot.self_id)
             
-            if bot_id and user_id == bot_id: 
-                print("⚠️ [调试] 忽略自身消息", flush=True)
-                return
-                
+            if bot_id and user_id == bot_id: return
         except Exception as e:
-            # ★★★ 关键：这里只打印警告，不再 return！ ★★★
-            print(f"⚠️ [调试] 自检跳过 (非致命错误): {e}", flush=True)
-            # pass 继续运行！
+            # 这里的报错忽略，继续运行
+            pass
 
         try:
             self.check_config_reload()
@@ -120,9 +115,9 @@ class MemeMaster(Star):
             uid = event.unified_msg_origin
             img_urls = self._get_all_img_urls(event)
             
-            # 收到消息
-            info = f"{msg_str[:10]}..." if msg_str else "[图片]"
-            print(f"📨 [Meme] 有效: {info} (图:{len(img_urls)})", flush=True)
+            # 日志
+            if msg_str or img_urls:
+                print(f"📨 [Meme] 收到: {msg_str[:10]}... (图:{len(img_urls)})", flush=True)
 
             self.last_active_time = time.time()
             self.last_uid = uid
@@ -141,7 +136,6 @@ class MemeMaster(Star):
                 if uid in self.sessions:
                     if self.sessions[uid].get('timer_task'): self.sessions[uid]['timer_task'].cancel()
                     self.sessions[uid]['flush_event'].set()
-                print("⚡ [调试] 指令穿透", flush=True)
                 return 
 
             # 防抖逻辑
@@ -189,14 +183,17 @@ class MemeMaster(Star):
                 msg_str = " ".join(combined_text_list)
                 img_urls = combined_images
 
-            # 记忆处理
+            # ★★★ 这里之前报错，现在不会了 ★★★
             self.msg_count += 1
+            
             threshold = self.local_config.get("summary_threshold", 40)
             curr_len = len(self.chat_history_buffer)
-            print(f"📊 [Meme] 处理完毕 (记忆: {curr_len}/{threshold})", flush=True)
+            print(f"📊 [Meme] 消息处理完毕 (记忆: {curr_len}/{threshold})", flush=True)
 
             img_mark = f" [Image*{len(img_urls)}]" if img_urls else ""
             log_entry = f"User: {msg_str}{img_mark}"
+            
+            # ★★★ 只要上面不报错，这就一定能保存！ ★★★
             self.chat_history_buffer.append(log_entry)
             self.save_buffer_to_disk()
             
@@ -443,9 +440,6 @@ class MemeMaster(Star):
                             await self.context.send_message(uid, mc)
                     except: pass
 
-    # ==========================
-    # 基础工具
-    # ==========================
     async def _init_image_hashes(self):
         if not os.path.exists(self.img_dir): return
         count = 0
